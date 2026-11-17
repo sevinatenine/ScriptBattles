@@ -6,6 +6,8 @@ const fs = require("fs");
 
 const crypto = require('node:crypto');
 
+const { startRuntime, tickRuntime, stopRuntime, nextAction, runtimes } = require("./runner");
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
@@ -28,7 +30,7 @@ function load(f) {
 const accounts = load("accounts.json");
 const users = load("users.json");
 
-for (const u of users) for (const s of u.data?.scripts ?? []) { s.status.running = false; s.status.lineNo = 0; }
+for (const u of users) for (const s of u.data?.scripts ?? []) { s.status.running = false; s.status.error = null; }
 
 let dirty = false;
 function writeAtomic(name, data) {
@@ -105,7 +107,6 @@ let tick = 0;
 function makeApi(user) {
     return {
         log: (msg) => console.log(`[${user.username}]`, msg),
-        move: (dir) => {},
         scan: (radius) => {
             const px = user.data.col ?? 0, py = user.data.row ?? 0;
             return users
@@ -127,6 +128,33 @@ const makeSnapshot = (user) => () => ({
     vision: [],
     nearestPlayerDistance: null,
 });
+
+const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+
+const ACTIONS = {
+    move(user, arg) {
+        const d = DIRS[arg];
+        if (!d) return;
+        user.data.col = (user.data.col ?? 0) + d[0];
+        user.data.row = (user.data.row ?? 0) + d[1];
+        dirty = true;
+        io.to(user.username).emit("playerMove", { col: user.data.col, row: user.data.row });
+    },
+    attack(user, arg) {},
+    wait() {},
+};
+
+setInterval(() => {
+    tick++;
+
+    for (const u of users) for (const s of u.data?.scripts ?? []) {
+        if (!s.status.running) continue;
+        const a = nextAction(s.id);
+        if (a && Object.hasOwn(ACTIONS, a.type)) ACTIONS[a.type](u, a.arg);
+    }
+
+    for (const id of [...runtimes.keys()]) tickRuntime(id);
+}, 200);
 
 app.post("/login", (req, res) => {
     const { username, password } = req.body;
@@ -157,10 +185,7 @@ app.post("/register", (req, res) => {
                 id: "0",
                 name: "Hello World",
                 script: "",
-                status: {
-                    running: false,
-                    lineNo: 0
-                }
+                status: { running: false, error: null }
             }
         ]
     } };
@@ -212,13 +237,33 @@ io.on("connection", (socket) => {
 
     socket.join(user.username);
 
-    socket.on("toggleScript", (id) => {
+    const starting = new Set();
+
+    socket.on("toggleScript", async (id) => {
         const s = typeof id === "string" && scripts.find(s => s.id === id);
-        if (!s) return;
-        s.status.running = !s.status.running;
-        if (!s.status.running) s.status.lineNo = 0;
-        dirty = true;
-        io.to(user.username).emit("scriptData", s);
+        if (!s || starting.has(s.id)) return;
+
+        const finish = (error) => {
+            s.status.running = false;
+            s.status.error = error ?? null;
+            dirty = true;
+            io.to(user.username).emit("scriptData", s);
+        };
+
+        if (s.status.running) { stopRuntime(s.id); return; }
+
+        starting.add(s.id);
+        try {
+            await startRuntime(s, makeApi(user), makeSnapshot(user), finish);
+            s.status.running = true;
+            s.status.error = null;
+            dirty = true;
+            io.to(user.username).emit("scriptData", s);
+        } catch (e) {
+            finish(e.message);
+        } finally {
+            starting.delete(s.id);
+        }
     });
 
     socket.on("saveScript", (msg) => {
@@ -227,6 +272,7 @@ io.on("connection", (socket) => {
         const s = scripts.find(s => s.id === msg.id);
         if (!s) return;
         s.script = msg.script;
+        if (s.status.running) stopRuntime(s.id);
         dirty = true;
         io.to(user.username).emit("scriptData", s);
     });
@@ -234,7 +280,7 @@ io.on("connection", (socket) => {
     socket.on("createScript", () => {
         if (scripts.length >= MAX_SCRIPTS) return;
         const s = { id: crypto.randomUUID(), name: "Untitled", script: "",
-                    status: { running: false, lineNo: 0 } };
+                    status: { running: false, error: null } };
         scripts.push(s);
         dirty = true;
         io.to(user.username).emit("scriptData", s);
@@ -256,6 +302,7 @@ io.on("connection", (socket) => {
         if (i === -1) return;
         scripts.splice(i, 1);
         dirty = true;
+        stopRuntime(id);
         io.to(user.username).emit("scriptDeleted", id);
     });
 

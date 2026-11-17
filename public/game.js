@@ -148,7 +148,8 @@ function reloadScripts() {
         btn.textContent = s.status.running ? "Stop" : "Start";
 
         const name = document.createElement("span");
-        name.textContent = s.name;
+        name.textContent = s.status.error ? `${s.name} ⚠ ${s.status.error}` : s.name;
+        if (s.status.error) name.style.color = "#c00";
 
         const controls = document.createElement("div");
         controls.className = "controls";
@@ -189,9 +190,7 @@ socket.on("connect_error", () => {
 
 resizeCanvas();
 
-socket.on("playerMove", (data) => {
-
-});
+socket.on("playerMove", ({ col, row }) => { player.col = col; player.row = row; });
 
 socket.on("scriptStopped", (data) => {
 
@@ -262,6 +261,8 @@ async function init() {
     }
     player.username = me.username;
     player.scripts = me.data?.scripts ?? [];
+    player.col = me.data?.col ?? 0;
+    player.row = me.data?.row ?? 0;
     socket.connect();
     reloadScripts();
     requestAnimationFrame(draw);

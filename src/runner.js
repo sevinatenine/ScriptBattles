@@ -6,20 +6,24 @@ const INIT_TIMEOUT = 500;
 const LOOP_TIMEOUT = 50;
 const SCANS_PER_TICK = 2;
 const MAX_SCAN_RADIUS = 20;
+const MAX_QUEUE = 10;
 
 const BOOTSTRAP = `
 (function () {
-    const mv = __move, lg = __log, sc = __scan;
-    delete global.__move; delete global.__log; delete global.__scan;
+    const ac = __act, lg = __log, sc = __scan;
+    delete global.__act; delete global.__log; delete global.__scan;
     let state = { tick: 0, player: {}, vision: [], nearestPlayerDistance: null };
 
     global.__setState = (s) => { state = s; };
 
     global.player = Object.freeze({
-        get x()  { return state.player.x; },
-        get y()  { return state.player.y; },
-        get hp() { return state.player.hp; },
-        move(dir) { mv(String(dir)); },
+        get x()      { return state.player.x; },
+        get y()      { return state.player.y; },
+        get hp()     { return state.player.hp; },
+        get queued() { return state.player.queued; },
+        move(dir)   { return ac("move", String(dir)); },
+        attack(dir) { return ac("attack", String(dir)); },
+        wait()      { return ac("wait", ""); },
     });
 
     global.world = Object.freeze({
@@ -34,13 +38,15 @@ const BOOTSTRAP = `
 `;
 
 function pushState(rt) {
-    return rt.setState.apply(undefined, [rt.getSnapshot()], { arguments: { copy: true } });
+    const snap = rt.getSnapshot();
+    snap.player.queued = rt.queue.length;
+    return rt.setState.apply(undefined, [snap], { arguments: { copy: true } });
 }
 
 async function startRuntime(s, api, getSnapshot, onStop) {
     const isolate = new ivm.Isolate({ memoryLimit: 32 });
     const rt = { isolate, init: null, loop: null, setState: null,
-                 getSnapshot, onStop, busy: false, stopped: false, scansLeft: SCANS_PER_TICK };
+                 getSnapshot, onStop, busy: false, stopped: false, scansLeft: SCANS_PER_TICK, queue: [] };
 
     try {
         const context = await isolate.createContext();
@@ -48,7 +54,11 @@ async function startRuntime(s, api, getSnapshot, onStop) {
         await jail.set("global", jail.derefInto());
 
         await jail.set("__log",  new ivm.Callback((m) => api.log(String(m).slice(0, 200))));
-        await jail.set("__move", new ivm.Callback((d) => api.move(String(d))));
+        await jail.set("__act", new ivm.Callback((type, arg) => {
+            if (rt.queue.length >= MAX_QUEUE) return false;
+            rt.queue.push({ type: String(type).slice(0, 16), arg: String(arg).slice(0, 16) });
+            return true;
+        }));
         await jail.set("__scan", new ivm.Callback((r) => {
             if (rt.scansLeft <= 0) return "[]";          // over budget: empty result
             rt.scansLeft--;
@@ -109,4 +119,8 @@ function stopRuntime(id, error) {
     rt.onStop?.(error);
 }
 
-module.exports = { startRuntime, tickRuntime, stopRuntime, runtimes };
+function nextAction(id) {
+    return runtimes.get(id)?.queue.shift() ?? null;
+}
+
+module.exports = { startRuntime, tickRuntime, stopRuntime, nextAction, runtimes };
