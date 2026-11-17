@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ScriptBattles</title>
+    <style>
+    html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        font-family: Arial, Helvetica, sans-serif;
+    }
+
+    body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    #container {
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        flex-direction: row;
+    }
+
+    #game {
+        flex: 70;
+        min-width: 0;
+        height: 100%;
+        display: block;
+        border-right: 1px solid black;
+    }
+
+    #side {
+        flex: 30;
+        min-width: 0;
+        display: flex;
+        padding: 10px;
+        flex-direction: column;
+    }
+
+    #loginForm, #registerForm {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid black;
+        padding: 10px;
+        gap: 10px;
+    }
+
+    button {
+        border: 1px solid black;
+        border-radius: 5px;
+        cursor: pointer;
+    }
+
+    [hidden] { display: none !important; }
+
+    .script-row { display: flex; padding: 5px; gap: 20px; cursor: pointer; border-radius: 5px; }
+    .script-row.selected { background-color: #ddd; }
+
+    .script-row .controls {
+        display: flex;
+        gap: 10px;
+    }
+
+    #scriptsList {
+        border: 1px solid black;
+        border-radius: 5px;
+    }
+
+    #scripts {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    #edit {
+        display: flex;
+        flex-direction: column;
+    }
+</style>
+</head>
+<body>
+    <div id="container">
+        <canvas id="game">
+        </canvas>
+        <div id="side">
+            <div id="scripts">
+                <h1>Scripts</h1>
+                <button onclick="createScript();">+</button>
+                <div id="scriptsList"></div>
+            </div>
+
+            <div id="edit">
+                <h1>Edit</h1>
+                <textarea id="editor" disabled spellcheck="false"
+                    style="flex:1; font-family:monospace; resize:none;"></textarea>
+            </div>
+        </div>
+    </div>
+
+    <form id="loginForm" action="/login" method="post" hidden>
+        <h2>Login</h2>
+        <label>
+            Username
+            <input name="username">
+        </label>
+
+        <label>
+            Password
+            <input name="password" type="password">
+        </label>
+
+        <button type="submit">Login</button>
+
+        <a href="javascript:switchLR();">Don't have an account?</a>
+    </form>
+
+    <form id="registerForm" hidden action="/register" method="post">
+        <h2>Register</h2>
+        <label>
+            Username
+            <input name="username">
+        </label>
+
+        <label>
+            Password
+            <input name="password" type="password">
+        </label>
+
+        <button type="submit">Register</button>
+
+        <a href="javascript:switchLR();">Have an account?</a>
+    </form>
+
+    <script>
+        const loginForm = document.getElementById("loginForm");
+        const registerForm = document.getElementById("registerForm");
+
+        function switchLR() {
+            loginForm.hidden = !loginForm.hidden;
+            registerForm.hidden = !registerForm.hidden;
+        }
+    </script>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="game.js"></script>
+</body>
+</html>
