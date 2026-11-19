@@ -80,6 +80,7 @@
     #edit {
         display: flex;
         flex-direction: column;
+        flex: 1;
     }
 </style>
 </head>
@@ -88,6 +89,11 @@
         <canvas id="game">
         </canvas>
         <div id="side">
+            <div id="stats">
+                <h1>Stats</h1>
+                <div id="stats-box"></div>
+            </div>
+
             <div id="scripts">
                 <h1>Scripts</h1>
                 <button onclick="createScript();">+</button>

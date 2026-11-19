@@ -5,6 +5,8 @@ const container = document.getElementById("container");
 const scriptsList = document.getElementById("scriptsList");
 const editor = document.getElementById("editor");
 
+const statsEl = document.getElementById("stats-box");
+
 const socket = io({ autoConnect: false });
 
 let width = 0;
@@ -114,6 +116,25 @@ function drawPlayer() {
 
 new ResizeObserver(resizeCanvas).observe(canvas);
 
+let entities = [];
+socket.on("entities", (list) => { entities = list; });
+
+const BOT = "#36c";
+const BOT_HIT = "#00eeff";
+const PLAYER = "#3a3";
+const PLAYER_HIT = "rgb(0, 255, 0)";
+const HIT_DURATION = 400;
+
+function drawEntities() {
+    const w = CELL_WIDTH * camera.zoom, h = CELL_HEIGHT * camera.zoom;
+    for (const e of entities) {
+        if (e.name === player.username) continue;
+        const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
+        ctx.fillStyle = e.type === "bot" ? ((Date.now() - e.lastHit) > HIT_DURATION ? BOT : BOT_HIT) : ((Date.now() - e.lastHit) > HIT_DURATION ? PLAYER : PLAYER_HIT);
+        ctx.fillRect(p.x - w / 2, p.y - h / 2, w, h);
+    }
+}
+
 let last = performance.now();
 function draw(now) {
     const dt = (now - last) / 1000;
@@ -126,6 +147,7 @@ function draw(now) {
     const origin = worldToScreen(0, 0);
     drawGrid(origin.x, origin.y);
     drawPlayer();
+    drawEntities();
 
     requestAnimationFrame(draw);
 }
@@ -190,11 +212,20 @@ socket.on("connect_error", () => {
 
 resizeCanvas();
 
-socket.on("playerMove", ({ col, row }) => { player.col = col; player.row = row; });
-
 socket.on("scriptStopped", (data) => {
 
 });
+
+let stats = { level: 1, xp: 0, next: 50 };
+
+function renderStats() {
+    statsEl.textContent =
+        `Level ${stats.level} · ${stats.xp}/${stats.next} XP\n` +
+        `Position (${player.col}, ${player.row})`;
+}
+
+socket.on("stats", (s) => { stats = s; renderStats(); });
+socket.on("playerMove", ({ col, row }) => { player.col = col; player.row = row; renderStats(); });
 
 let selectedId = null;
 let selectNext = false;
@@ -246,6 +277,17 @@ socket.on("scriptDeleted", (id) => {
     player.scripts = player.scripts.filter(x => x.id !== id);
     if (selectedId === id) selectScript(player.scripts[0]?.id ?? null);
     else reloadScripts();
+});
+
+canvas.tabIndex = 0;
+canvas.addEventListener("pointerdown", () => canvas.focus());
+
+const GAME_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
+
+canvas.addEventListener("keydown", (e) => {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (GAME_KEYS.has(e.key)) e.preventDefault();
+    socket.emit("event", "key", e.key);
 });
 
 async function init() {

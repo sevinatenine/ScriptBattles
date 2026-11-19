@@ -6,11 +6,15 @@ const fs = require("fs");
 
 const crypto = require('node:crypto');
 
-const { startRuntime, tickRuntime, stopRuntime, nextAction, runtimes } = require("./runner");
+const { startRuntime, tickRuntime, stopRuntime, nextAction, sendEvent, runtimes } = require("./runner");
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
+
+const online = new Map();
+const starting = new Set();
+const isActive = (u) => online.has(u.username) || u.data.scripts?.some(s => s.status.running);
 
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -29,10 +33,44 @@ function load(f) {
 
 const accounts = load("accounts.json");
 const users = load("users.json");
+const bots = load("bots.json").map(b => ({ ...b, maxHp: b.hp, spawn: { col: b.col, row: b.row } }));
+
+const RESPAWN_TICKS = 25;
+const liveBots = () => bots.filter(b => !b.dead);
+
+const XP_PER_LEVEL = 50;
+const levelFor = (xp) => 1 + Math.floor(Math.sqrt((xp ?? 0) / XP_PER_LEVEL));
+const damageFor = (user) => 10 + 2 * (levelFor(user.data.xp) - 1);
+
+const statsOf = (user) => {
+    const xp = user.data.xp ?? 0, level = levelFor(xp);
+    return { xp, level, next: XP_PER_LEVEL * level ** 2 };
+};
+
+function giveXp(user, amount) {
+    user.data.xp = (user.data.xp ?? 0) + amount;
+    dirty = true;
+    io.to(user.username).emit("stats", statsOf(user));
+}
+
+const BOT_AI = {
+    idle() {},
+    wander(b) {
+        if (Math.random() > 0.3) return;
+        const d = Object.values(DIRS)[Math.floor(Math.random() * 4)];
+        if (Math.abs(b.col + d[0] - b.spawn.col) > 6 || Math.abs(b.row + d[1] - b.spawn.row) > 6) return;
+        b.col += d[0]; b.row += d[1];
+    },
+};
 
 for (const u of users) for (const s of u.data?.scripts ?? []) { s.status.running = false; s.status.error = null; }
 
 let dirty = false;
+
+// for (const u of users) for (const s of u.data?.scripts ?? []) {
+//     if (s.id === "0") { s.id = crypto.randomUUID(); dirty = true; }
+// }
+
 function writeAtomic(name, data) {
     const p = path.join(DATA_DIR, name);
     fs.writeFileSync(p + ".tmp", JSON.stringify(data));
@@ -104,30 +142,35 @@ function accountFromToken(token) {
 
 let tick = 0;
 
+function nearby(user, radius, type) {
+    const px = user.data.col ?? 0, py = user.data.row ?? 0;
+    return [
+        ...(type === "bot" ? [] : users.filter(u => u !== user && isActive(u)).map(u => ({
+            type: "user", name: u.username, x: u.data.col ?? 0, y: u.data.row ?? 0, hp: u.data.hp ?? 100 }))),
+        ...(type === "user" ? [] : liveBots().map(b => ({
+            type: "bot", kind: b.kind, name: b.id, x: b.col, y: b.row, hp: b.hp }))),
+    ]
+        .map(e => ({ ...e, dist: Math.hypot(e.x - px, e.y - py) }))
+        .filter(e => e.dist <= radius)
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, 20);
+}
+
 function makeApi(user) {
     return {
         log: (msg) => console.log(`[${user.username}]`, msg),
-        scan: (radius) => {
-            const px = user.data.col ?? 0, py = user.data.row ?? 0;
-            return users
-                .filter(u => u !== user)
-                .map(u => {
-                    const x = u.data.col ?? 0, y = u.data.row ?? 0;
-                    return { name: u.username, x, y, dist: Math.hypot(x - px, y - py) };
-                })
-                .filter(e => e.dist <= radius)
-                .sort((a, b) => a.dist - b.dist)
-                .slice(0, 20);
-        },
+        scan: (radius, type) => nearby(user, radius, type),
     };
 }
-
-const makeSnapshot = (user) => () => ({
-    tick,
-    player: { x: user.data.col ?? 0, y: user.data.row ?? 0, hp: user.data.hp ?? 100 },
-    vision: [],
-    nearestPlayerDistance: null,
-});
+const makeSnapshot = (user) => () => {
+    const near = nearby(user, 5);
+    return {
+        tick,
+        player: { x: user.data.col ?? 0, y: user.data.row ?? 0, hp: user.data.hp ?? 100, xp: user.data.xp ?? 0, level: levelFor(user.data.xp) },
+        vision: near,
+        nearestPlayerDistance: near.find(e => e.type === "user")?.dist ?? null,
+    };
+};
 
 const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
 
@@ -140,20 +183,69 @@ const ACTIONS = {
         dirty = true;
         io.to(user.username).emit("playerMove", { col: user.data.col, row: user.data.row });
     },
-    attack(user, arg) {},
+    attackClosest(user) {
+        for (const d of Object.values(DIRS)) {
+            const tx = (user.data.col ?? 0) + d[0], ty = (user.data.row ?? 0) + d[1];
+            const bot = liveBots().find(b => b.col === tx && b.row === ty);
+            if (!bot) continue;
+
+            bot.hp -= damageFor(user);
+            bot.lastHit = Date.now();
+            if (bot.hp <= 0) {
+                bot.dead = true;
+                bot.respawnAt = tick + RESPAWN_TICKS;
+                giveXp(user, bot.xp ?? 0);
+            }
+            return true;
+        }
+        return false;
+    },
+    attack(user, arg) {
+        const d = DIRS[arg];
+        if (!d) return;
+        const tx = (user.data.col ?? 0) + d[0], ty = (user.data.row ?? 0) + d[1];
+        const bot = liveBots().find(b => b.col === tx && b.row === ty);
+        if (!bot) return;
+        bot.hp -= damageFor(user);
+        bot.lastHit = Date.now();
+        if (bot.hp > 0) return;
+        bot.dead = true;
+        bot.respawnAt = tick + RESPAWN_TICKS;
+        giveXp(user, bot.xp ?? 0);
+    },
     wait() {},
 };
 
 setInterval(() => {
     tick++;
 
-    for (const u of users) for (const s of u.data?.scripts ?? []) {
-        if (!s.status.running) continue;
-        const a = nextAction(s.id);
-        if (a && Object.hasOwn(ACTIONS, a.type)) ACTIONS[a.type](u, a.arg);
+    for (const u of users) {
+        for (const s of u.data?.scripts ?? []) {
+            if (!s.status.running) continue;
+            const a = nextAction(s.id);
+            if (!a) continue;
+            if (Object.hasOwn(ACTIONS, a.type)) {
+                try { ACTIONS[a.type](u, a.arg); }
+                catch (e) { console.error(`action ${a.type} failed:`, e); }
+            }
+            break;
+        }
     }
 
     for (const id of [...runtimes.keys()]) tickRuntime(id);
+
+    for (const b of bots) {
+        if (b.dead && tick >= b.respawnAt) {
+            b.dead = false; b.col = b.spawn.col; b.row = b.spawn.row; b.hp = b.maxHp;
+        }
+    }
+    
+    for (const b of liveBots()) if (Object.hasOwn(BOT_AI, b.ai)) BOT_AI[b.ai](b);
+
+    io.emit("entities", [
+        ...liveBots().map(b => ({ type: "bot", kind: b.kind, name: b.id, col: b.col, row: b.row, hp: b.hp, lastHit: b.lastHit || 0 })),
+        ...users.filter(isActive).map(u => ({ type: "user", name: u.username, col: u.data.col ?? 0, lastHit: u.lastHit || 0, row: u.data.row ?? 0 })),
+    ]);
 }, 200);
 
 app.post("/login", (req, res) => {
@@ -167,10 +259,12 @@ app.post("/login", (req, res) => {
     res.redirect("/");
 });
 
+const STARTER = `function init() {\n}\n\nfunction loop() {\n    if (player.queued > 0) return;\n    player.move("right");\n}\n`;
+
 app.post("/register", (req, res) => {
     const { username, password } = req.body;
     if (typeof username !== "string" || typeof password !== "string"
-        || !username.trim() || password.length < 8) return res.redirect("/");
+        || !/^[A-Za-z0-9_]{3,20}$/.test(username) || password.length < 8) return res.redirect("/");
 
     if (accounts.some(a => a.username.toLowerCase() === username.toLowerCase()))
         return res.redirect("/");
@@ -182,9 +276,9 @@ app.post("/register", (req, res) => {
     const user = { username, data: {
         scripts: [
             {
-                id: "0",
+                id: crypto.randomUUID(),
                 name: "Hello World",
-                script: "",
+                script: STARTER,
                 status: { running: false, error: null }
             }
         ]
@@ -218,15 +312,22 @@ app.post("/logout", (req, res) => {
 });
 
 function parseCookies(header = "") {
-    return Object.fromEntries(header.split(";").map(c => c.trim().split("=").map(decodeURIComponent)));
+    const out = {};
+    for (const part of header.split(";")) {
+        const i = part.indexOf("=");
+        if (i < 0) continue;
+        try { out[decodeURIComponent(part.slice(0, i).trim())] = decodeURIComponent(part.slice(i + 1).trim()); }
+        catch {}
+    }
+    return out;
 }
+
 io.use((socket, next) => {
     const account = accountFromToken(parseCookies(socket.handshake.headers.cookie).session);
     if (!account) return next(new Error("unauthorized"));
     socket.account = account;
     next();
 });
-
 
 const MAX_SCRIPTS = 20;
 const MAX_SCRIPT_CHARS = 10_000;
@@ -237,7 +338,9 @@ io.on("connection", (socket) => {
 
     socket.join(user.username);
 
-    const starting = new Set();
+    online.set(user.username, (online.get(user.username) ?? 0) + 1)
+
+    socket.emit("stats", statsOf(user));
 
     socket.on("toggleScript", async (id) => {
         const s = typeof id === "string" && scripts.find(s => s.id === id);
@@ -252,6 +355,8 @@ io.on("connection", (socket) => {
 
         if (s.status.running) { stopRuntime(s.id); return; }
 
+        if (scripts.filter(x => x.status.running).length >= 3) return finish("max 3 running scripts");
+
         starting.add(s.id);
         try {
             await startRuntime(s, makeApi(user), makeSnapshot(user), finish);
@@ -263,6 +368,18 @@ io.on("connection", (socket) => {
             finish(e.message);
         } finally {
             starting.delete(s.id);
+        }
+    });
+
+    const EVENT_TYPES = new Set(["key"]);
+
+    socket.on("event", (type, data) => {
+        if (!EVENT_TYPES.has(type)) return;
+        if (typeof data !== "string" || data.length > 16) return;
+
+        for (const s of scripts) {
+            if (!s.status.running) continue;
+            sendEvent(s.id, type, data);
         }
     });
 
@@ -306,7 +423,11 @@ io.on("connection", (socket) => {
         io.to(user.username).emit("scriptDeleted", id);
     });
 
-    socket.on("disconnect", () => console.log(`${user.username} disconnected`));
+    socket.on("disconnect", () => {
+        const n = (online.get(user.username) ?? 1) - 1;
+        if (n <= 0) online.delete(user.username); else online.set(user.username, n);
+        console.log(`${user.username} disconnected`);
+    });
 });
 
 const PORT = process.env.PORT || 3000;

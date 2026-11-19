@@ -23,17 +23,56 @@ const BOOTSTRAP = `
         get queued() { return state.player.queued; },
         move(dir)   { return ac("move", String(dir)); },
         attack(dir) { return ac("attack", String(dir)); },
+        attackClosest() { return ac("attackClosest", "") },
         wait()      { return ac("wait", ""); },
+        get xp()    { return state.player.xp; },
+        get level() { return state.player.level; },
     });
+
+    const listeners = { key: [] };
+    const MAX_LISTENERS = 8;
+
+    function on(type, fn) {
+        if (typeof fn !== "function") throw new TypeError("listener must be a function");
+        const list = listeners[type];
+        if (list.length >= MAX_LISTENERS) throw new Error("too many " + type + " listeners");
+        list.push(fn);
+        return () => {
+            const i = list.indexOf(fn);
+            if (i >= 0) list.splice(i, 1);
+        };
+    }
+
+    global.ui = Object.freeze({
+        onKey(fn) { return on("key", fn); },
+    });
+
+    global.__dispatch = (type, payload) => {
+        const list = listeners[type];
+        if (!list) return;
+        for (const fn of list.slice()) {
+            try { fn(payload); }
+            catch (e) { lg("listener error: " + e.message); }
+        }
+    };
+
+    const scan = (r, t) => JSON.parse(sc(Number(r), t));
+    const pick = (t, r) => r === undefined
+        ? state.vision.filter(e => !t || e.type === t)
+        : scan(r, t);
 
     global.world = Object.freeze({
         get vision() { return state.vision; },
         get nearestPlayerDistance() { return state.nearestPlayerDistance; },
         get tick() { return state.tick; },
-        scan(radius) { return JSON.parse(sc(Number(radius))); },
+        scan(radius) { return scan(radius); },
+        players(radius)  { return pick("user", radius); },
+        bots(radius)     { return pick("bot", radius); },
+        entities(radius) { return pick(undefined, radius); },
     });
 
     global.log = (...a) => lg(a.join(" "));
+    global.console = Object.freeze({ log: global.log, warn: global.log, error: global.log });
 })();
 `;
 
@@ -45,32 +84,36 @@ function pushState(rt) {
 
 async function startRuntime(s, api, getSnapshot, onStop) {
     const isolate = new ivm.Isolate({ memoryLimit: 32 });
-    const rt = { isolate, init: null, loop: null, setState: null,
-                 getSnapshot, onStop, busy: false, stopped: false, scansLeft: SCANS_PER_TICK, queue: [] };
+    const rt = { isolate, init: null, loop: null, setState: null, dispatch: null,
+             getSnapshot, onStop, busy: false, stopped: false,
+             scansLeft: SCANS_PER_TICK, queue: [], pendingEvents: 0 };
 
     try {
         const context = await isolate.createContext();
         const jail = context.global;
         await jail.set("global", jail.derefInto());
 
-        await jail.set("__log",  new ivm.Callback((m) => api.log(String(m).slice(0, 200))));
+        await jail.set("__log", new ivm.Callback((m) => api.log(String(m).slice(0, 200))));
         await jail.set("__act", new ivm.Callback((type, arg) => {
             if (rt.queue.length >= MAX_QUEUE) return false;
             rt.queue.push({ type: String(type).slice(0, 16), arg: String(arg).slice(0, 16) });
             return true;
         }));
-        await jail.set("__scan", new ivm.Callback((r) => {
-            if (rt.scansLeft <= 0) return "[]";          // over budget: empty result
+        await jail.set("__scan", new ivm.Callback((r, t) => {
+            if (rt.scansLeft <= 0) return "[]";
             rt.scansLeft--;
             const radius = Math.min(Math.max(Number(r) || 0, 0), MAX_SCAN_RADIUS);
-            return JSON.stringify(api.scan(radius));     // callbacks can only return primitives
+            const type = t === "user" || t === "bot" ? t : undefined;
+            return JSON.stringify(api.scan(radius, type));
         }));
 
         await (await isolate.compileScript(BOOTSTRAP)).run(context);
-        rt.setState = await jail.get("__setState", { reference: true });
-        await context.eval("delete global.__setState");  // scripts can't reach it
 
-        await pushState(rt);                             // so init() sees real state
+        rt.setState = await jail.get("__setState", { reference: true });
+        rt.dispatch = await jail.get("__dispatch", { reference: true });
+        await context.eval("delete global.__setState; delete global.__dispatch");
+
+        await pushState(rt); 
 
         await (await isolate.compileScript(s.script)).run(context, { timeout: INIT_TIMEOUT });
 
@@ -107,7 +150,7 @@ async function tickRuntime(id) {
 
 function disposeRuntime(rt) {
     rt.stopped = true;
-    try { rt.init?.release(); rt.loop?.release(); rt.setState?.release(); } catch {}
+    try { rt.init?.release(); rt.loop?.release(); rt.setState?.release(); rt.dispatch?.release(); } catch {}
     try { if (!rt.isolate.isDisposed) rt.isolate.dispose(); } catch {}
 }
 
@@ -123,4 +166,23 @@ function nextAction(id) {
     return runtimes.get(id)?.queue.shift() ?? null;
 }
 
-module.exports = { startRuntime, tickRuntime, stopRuntime, nextAction, runtimes };
+const MAX_PENDING_EVENTS = 10;
+
+async function sendEvent(id, type, payload) {
+    const rt = runtimes.get(id);
+    if (!rt || rt.stopped || !rt.dispatch) return;
+    if (rt.pendingEvents >= MAX_PENDING_EVENTS) return;
+    rt.pendingEvents++;
+    try {
+        await rt.dispatch.apply(undefined, [type, String(payload).slice(0, 16)], {
+            arguments: { copy: true },
+            timeout: LOOP_TIMEOUT,
+        });
+    } catch (e) {
+        stopRuntime(id, e.message);
+    } finally {
+        rt.pendingEvents--;
+    }
+}
+
+module.exports = { startRuntime, tickRuntime, stopRuntime, nextAction, sendEvent, runtimes };
