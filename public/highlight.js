@@ -6,15 +6,21 @@ const editor = document.getElementById("editor");
 const code = document.querySelector("#hl code");
 const pre = document.getElementById("hl");
 
-function sync() {
-    code.textContent = editor.value + "\n";
-    delete code.dataset.highlighted;
-    hljs.highlightElement(code);
+function syncScroll() {
     pre.scrollTop = editor.scrollTop;
     pre.scrollLeft = editor.scrollLeft;
 }
+
+function sync() {
+    const v = editor.value;
+    code.textContent = v.endsWith("\n") ? v + " " : v;
+    delete code.dataset.highlighted;
+    hljs.highlightElement(code);
+    syncScroll();
+}
+
 editor.addEventListener("input", sync);
-editor.addEventListener("scroll", () => { pre.scrollTop = editor.scrollTop; pre.scrollLeft = editor.scrollLeft; });
+editor.addEventListener("scroll", syncScroll);
 window.refreshHighlight = sync;
 
 hljs.highlightAll();

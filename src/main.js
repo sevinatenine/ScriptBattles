@@ -16,6 +16,8 @@ const online = new Map();
 const starting = new Set();
 const isActive = (u) => online.has(u.username) || u.data.scripts?.some(s => s.status.running);
 
+var userSockets = new Map();
+
 app.use(express.static(path.join(__dirname, '../public')));
 
 const hljsDir = path.join(__dirname, '../node_modules/@highlightjs/cdn-assets');
@@ -38,6 +40,8 @@ function load(f) {
 const accounts = load("accounts.json");
 const users = load("users.json");
 var walls = load("walls.json");
+
+var drops = [];
 
 const MAP_X_OFFSET = -150;
 const MAP_Y_OFFSET = -150;
@@ -178,9 +182,27 @@ const statsOf = (user) => {
 const sendStats = (user) => io.to(user.username).emit("stats", statsOf(user));
 
 function giveXp(user, amount) {
+    const beforeLevel = levelFor(user.data.xp);
     user.data.xp = (user.data.xp ?? 0) + amount;
+    const nowLevel = levelFor(user.data.xp);
+    if (nowLevel > beforeLevel) {
+        io.to(user.username).emit("notify", {
+            header: `You leveled up!`,
+            body: `Level ${beforeLevel} -> Level ${nowLevel}`,
+        });
+    }
     dirty = true;
     sendStats(user);
+}
+
+const DEATH_XP_LOSS = 0.10;                          // fraction of in-level progress
+const levelFloor = (level) => XP_PER_LEVEL * (level - 1) ** 2;   // XP where a level starts
+
+function applyDeathPenalty(victim) {
+    const xp = victim.data.xp ?? 0;
+    const lost = Math.floor((xp - levelFloor(levelFor(xp))) * DEATH_XP_LOSS);
+    victim.data.xp = xp - lost;                      // always stays >= the level's floor
+    return lost;
 }
 
 const nearestPlayer = (b, radius) => {
@@ -207,7 +229,22 @@ function stepToward(b, tc, tr) {
     return false;
 }
 
-function hurt(victim, dmg) {
+function formatBot(b) {
+    return b[0].toUpperCase() + b.slice(1);
+}
+
+function killPlayer(victim, killerLabel) {
+    const lost = applyDeathPenalty(victim);
+    createDrop(colOf(victim), rowOf(victim), getDrops("user"));
+    io.to(victim.username).emit("notify", {
+        header: `Killed by ${killerLabel}`,
+        body: lost > 0 ? `-${lost} XP` : "You were killed",
+    });
+    dirty = true;
+    respawn(victim);
+}
+
+function hurt(victim, dmg, attacker) {
     if (!victim) return false;
     if ((protectedUntil.get(victim.username) ?? 0) > tick) return false;
 
@@ -216,11 +253,10 @@ function hurt(victim, dmg) {
     dirty = true;
 
     if (victim.data.hp <= 0) {
-        respawn(victim);
+        killPlayer(victim, `${formatBot(attacker.kind)} (Bot)`);
     } else {
         sendStats(victim);
     }
-
     return true;
 }
 
@@ -251,7 +287,7 @@ function goHome(b, tol = 1.5) {
 
 function chase(b, target) {
     if (adjacent(b, target)) {
-        if (tick >= (b.nextAttack ?? 0)) { hurt(target, b.damage); b.nextAttack = tick + (b.attackEvery ?? 5); }
+        if (tick >= (b.nextAttack ?? 0)) { hurt(target, b.damage, b); b.nextAttack = tick + (b.attackEvery ?? 5); }
     } else if (stepsNow(b, b.chaseEvery ?? 2)) {
         stepToward(b, colOf(target), rowOf(target));
     }
@@ -401,6 +437,15 @@ function nearby(user, radius, type) {
         .slice(0, 20);
 }
 
+function nearbyDrops(user, radius) {
+    const px = colOf(user), py = rowOf(user);
+    return drops
+        .map(d => ({ kind: d.kind, x: d.x, y: d.y, dist: Math.hypot(d.x - px, d.y - py) }))
+        .filter(d => d.dist <= radius)
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, 20);
+}
+
 function makeApi(user) {
     const pos = () => [user.data.col ?? 0, user.data.row ?? 0];
     return {
@@ -417,6 +462,7 @@ function makeApi(user) {
             }
             return out;
         },
+        drops: (radius) => nearbyDrops(user, radius),
     };
 }
 
@@ -427,6 +473,7 @@ const makeSnapshot = (user) => () => {
         player: { x: user.data.col ?? 0, y: user.data.row ?? 0, hp: hpOf(user), maxHp: maxHpFor(user), xp: user.data.xp ?? 0, level: levelFor(user.data.xp) },
         vision: near,
         nearestPlayerDistance: near.find(e => e.type === "user")?.dist ?? null,
+        drops: nearbyDrops(user, 5),
     };
 };
 
@@ -481,6 +528,23 @@ function freeTileNear(col, row) {
     return [col, row];
 }
 
+const HEART_BOT_DROP_CHANCE = 0.2;
+const HEART_USER_DROP_CHANCE = 0.5;
+
+function getDrops(type, kind) {
+    return (Math.random() < ((type == "bot") ? HEART_BOT_DROP_CHANCE : HEART_USER_DROP_CHANCE)) ? "heart" : null;
+}
+
+const DROP_TTL_MS = 60_000;
+const MAX_DROPS = 200;
+const HEART_HEAL = 25;
+
+function createDrop(col, row, kind) {
+    if (!kind) return;
+    if (drops.length >= MAX_DROPS) drops.shift();
+    drops.push({ x: col, y: row, kind, expires: Date.now() + DROP_TTL_MS });
+}
+
 function respawn(user) {
     const [c, r] = nearestTileOpen(SPAWN.row, SPAWN.col) ?? [SPAWN.col, SPAWN.row];
     user.data.hp = maxHpFor(user);
@@ -500,9 +564,11 @@ function strike(user, tx, ty) {
         bot.lastAttacker = user.username;
         bot.aggroUntil = tick + 40;
         if (bot.hp <= 0) {
+            io.to(user.username).emit("notify", { header: `Killed ${formatBot(bot.kind)}`, body: `+${bot.xp ?? 0} XP` });
             bot.dead = true;
             bot.respawnAt = tick + RESPAWN_TICKS;
             giveXp(user, bot.xp ?? 0);
+            createDrop(tx, ty, getDrops("bot", bot.kind));
         }
         return true;
     }
@@ -515,8 +581,10 @@ function strike(user, tx, ty) {
     victim.lastHit = Date.now();
     dirty = true;
     if (victim.data.hp <= 0) {
-        giveXp(user, KILL_XP_BASE + Math.floor((victim.data.xp ?? 0) * 0.1));
-        respawn(victim);
+        const xp = KILL_XP_BASE + Math.floor((victim.data.xp ?? 0) * 0.1);   // computed BEFORE the penalty
+        giveXp(user, xp);
+        io.to(user.username).emit("notify", { header: `Killed ${victim.username}`, body: `+${xp} XP` });
+        killPlayer(victim, user.username);
     } else {
         sendStats(victim);
     }
@@ -575,16 +643,59 @@ setInterval(() => {
             const t = nearestTileOpen(b.spawn.row, b.spawn.col);
             if (t) { b.dead = false; [b.col, b.row] = t; b.hp = b.maxHp; b.lastAttacker = null; b.returning = false; b.nextAttack = 0; }
         }
-
     }
     
-    for (const b of liveBots()) if (Object.hasOwn(BOT_AI, b.ai)) BOT_AI[b.ai](b);
+    for (const b of liveBots()) {
+        if (!Object.hasOwn(BOT_AI, b.ai)) continue;
+        try { BOT_AI[b.ai](b); }
+        catch (e) { console.error(`bot ${b.id} (${b.ai}) failed:`, e); }
+    }
 
     io.emit("entities", [
         ...liveBots().map(b => ({ type: "bot", kind: b.kind, ai: b.ai, name: b.id, col: b.col, row: b.row, hp: b.hp, maxHp: b.maxHp, lastHit: b.lastHit || 0 })),
         ...users.filter(isActive).map(u => ({ type: "user", name: u.username, col: u.data.col ?? 0, lastHit: u.lastHit || 0, row: u.data.row ?? 0, hp: hpOf(u), maxHp: maxHpFor(u) })),
     ]);
+
+    const now = Date.now();
+    drops = drops.filter(d => d.expires > now);
+
+    for (const u of users) {
+        if (!isActive(u) || hpOf(u) >= maxHpFor(u)) continue;   // full HP: leave it on the floor
+        const i = drops.findIndex(d => d.x === colOf(u) && d.y === rowOf(u));
+        if (i === -1) continue;
+        drops.splice(i, 1);
+        u.data.hp = Math.min(maxHpFor(u), hpOf(u) + HEART_HEAL);
+        dirty = true;
+        sendStats(u);
+    }
+
+    io.emit("drops", drops);
 }, 200);
+
+const LEADERBOARD_SIZE = 3;
+
+function buildLeaderboard() {
+    return users
+        .map(u => ({ name: u.username, xp: u.data.xp ?? 0 }))
+        .sort((a, b) => b.xp - a.xp || a.name.localeCompare(b.name))
+        .map((e, i) => ({ ...e, level: levelFor(e.xp), rank: i + 1 }));
+}
+
+function leaderboardPayload(name, board = buildLeaderboard()) {
+    return {
+        top: board.slice(0, LEADERBOARD_SIZE),
+        me: board.find(e => e.name === name) ?? null,
+        total: board.length,
+    };
+}
+
+setInterval(() => {
+    if (online.size === 0) return;
+    const board = buildLeaderboard();
+    for (const name of online.keys()) {
+        io.to(name).emit("leaderboard", leaderboardPayload(name, board));
+    }
+}, 4000);
 
 app.post("/login", (req, res) => {
     const { username, password } = req.body;
@@ -598,6 +709,103 @@ app.post("/login", (req, res) => {
 });
 
 const STARTER = `function init() {\n}\n\nfunction loop() {\n    if (player.queued > 0) return;\n    player.move("right");\n}\n`;
+const STARTER2 = `const R = 20;
+const SIZE = 2 * R + 1;
+const DIRS = [[1, 0, "right"], [-1, 0, "left"], [0, 1, "down"], [0, -1, "up"]];
+
+let lastX = null, lastY = null, moved = false, stuck = 0;
+
+function pathStep(tx, ty) {
+    const grid = world.tiles(R);
+    if (!grid.length) return null;
+
+    const gx = tx - player.x + R, gy = ty - player.y + R;
+    const start = R * SIZE + R;
+    const parent = new Int32Array(SIZE * SIZE).fill(-2);
+    parent[start] = -1;
+
+    const queue = [start];
+    let best = start, bestD = Infinity;
+
+    for (let i = 0; i < queue.length; i++) {
+        const cur = queue[i];
+        const cx = cur % SIZE, cy = (cur - cx) / SIZE;
+
+        const d = Math.abs(cx - gx) + Math.abs(cy - gy);
+        if (d < bestD) { bestD = d; best = cur; if (d === 0) break; }
+
+        for (const [dx, dy] of DIRS) {
+            const nx = cx + dx, ny = cy + dy;
+            if (nx < 0 || ny < 0 || nx >= SIZE || ny >= SIZE) continue;
+            const n = ny * SIZE + nx;
+            if (parent[n] !== -2 || grid[ny][nx] !== 0) continue;
+            parent[n] = cur;
+            queue.push(n);
+        }
+    }
+
+    if (best === start) return null;
+    let c = best;
+    while (parent[c] !== start) c = parent[c];
+    const sx = (c % SIZE) - R, sy = Math.floor(c / SIZE) - R;
+    return DIRS.find(([dx, dy]) => dx === sx && dy === sy)[2];
+}
+
+function walkTo(tx, ty) {
+    const dir = pathStep(tx, ty);
+    if (!dir) return false;
+    moved = true;
+    player.move(dir);
+    return true;
+}
+
+function wander() {
+    moved = true;
+    player.move(DIRS[Math.floor(Math.random() * 4)][2]);
+}
+
+function loop() {
+    if (player.queued > 0) return;
+
+    stuck = moved && player.x === lastX && player.y === lastY ? stuck + 1 : 0;
+    lastX = player.x; lastY = player.y; moved = false;
+    if (stuck >= 2) return wander();
+
+    if (player.hp < player.maxHp * 0.5) {
+        const [d] = world.drops(20);
+        if (d && walkTo(d.x, d.y)) return;
+    }
+
+    const [b] = world.bots(20);
+    if (b) {
+        if (b.dist <= 1) return player.attackClosest();
+        if (walkTo(b.x, b.y)) return;
+    }
+
+    wander();
+}`;
+const STARTER3 = `function m(d) {
+    if(player.queued >= 1) return;
+    player.move(d);
+}
+
+function init() {
+    ui.onKey((key) => {
+        if (key == "w") m("up");
+        else if (key == "a") m("left");
+        else if (key == "s") m("down");
+        else if (key == "d") m("right");
+        else if (key == " ") player.attackClosest();
+    });
+}
+
+function loop() {
+}`;
+const STARTER4 = `function init() {}
+
+function loop() {
+    player.move(["up", "down", "left", "right"][Math.floor(Math.random() * 4)]);
+}`
 
 const fail = (res, msg) => res.redirect("/?error=" + encodeURIComponent(msg));
 
@@ -618,6 +826,24 @@ app.post("/register", (req, res) => {
                 id: crypto.randomUUID(),
                 name: "Hello World",
                 script: STARTER,
+                status: { running: false, error: null }
+            },
+            {
+                id: crypto.randomUUID(),
+                name: "Auto Kill",
+                script: STARTER2,
+                status: { running: false, error: null }
+            },
+            {
+                id: crypto.randomUUID(),
+                name: "Controls",
+                script: STARTER3,
+                status: { running: false, error: null }
+            },
+            {
+                id: crypto.randomUUID(),
+                name: "Random",
+                script: STARTER4,
                 status: { running: false, error: null }
             }
         ]
@@ -689,9 +915,17 @@ io.on("connection", (socket) => {
 
     socket.join(user.username);
 
+    const list = userSockets.get(user.username) ?? [];
+    list.push(socket);
+    userSockets.set(user.username, list);
+
     if (user.data.col == null) respawn(user);
 
     online.set(user.username, (online.get(user.username) ?? 0) + 1)
+
+    socket.emit("leaderboard", leaderboardPayload(user.username));
+
+    socket.emit("stats", statsOf(user));
 
     socket.emit("stats", statsOf(user));
 
@@ -781,6 +1015,11 @@ io.on("connection", (socket) => {
     socket.on("disconnect", () => {
         const n = (online.get(user.username) ?? 1) - 1;
         if (n <= 0) online.delete(user.username); else online.set(user.username, n);
+
+        const rest = (userSockets.get(user.username) ?? []).filter(s => s !== socket);
+        if (rest.length) userSockets.set(user.username, rest);
+        else userSockets.delete(user.username);
+
         console.log(`${user.username} disconnected`);
     });
 });

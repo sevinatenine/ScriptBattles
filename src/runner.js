@@ -8,13 +8,14 @@ const SCANS_PER_TICK = 2;
 const MAX_SCAN_RADIUS = 20;
 const TILES_PER_TICK = 2;
 const MAX_QUEUE = 10;
+const DROP_SCANS_PER_TICK = 2;
 
 const BOOTSTRAP = `
 (function () {
-    const ac = __act, lg = __log, sc = __scan, wl = __wall, ti = __tiles;
+    const ac = __act, lg = __log, sc = __scan, wl = __wall, ti = __tiles, dr = __drops;
     delete global.__act; delete global.__log; delete global.__scan;
-    delete global.__wall; delete global.__tiles;
-    let state = { tick: 0, player: {}, vision: [], nearestPlayerDistance: null };
+    delete global.__wall; delete global.__tiles; delete global.__drops;
+    let state = { tick: 0, player: {}, vision: [], drops: [], nearestPlayerDistance: null };
 
     global.__setState = (s) => { state = s; };
 
@@ -70,6 +71,7 @@ const BOOTSTRAP = `
         get tick() { return state.tick; },
         wall(dx, dy) { return wl(Number(dx), Number(dy)); },
         tiles(radius) { return JSON.parse(ti(Number(radius))); },
+        drops(radius) { return radius === undefined ? state.drops : JSON.parse(dr(Number(radius))); },
         scan(radius) { return scan(radius); },
         players(radius)  { return pick("user", radius); },
         bots(radius)     { return pick("bot", radius); },
@@ -91,7 +93,7 @@ async function startRuntime(s, api, getSnapshot, onStop) {
     const isolate = new ivm.Isolate({ memoryLimit: 32 });
     const rt = { isolate, init: null, loop: null, setState: null, dispatch: null,
              getSnapshot, onStop, busy: false, stopped: false,
-             scansLeft: SCANS_PER_TICK, tilesLeft: TILES_PER_TICK, queue: [], pendingEvents: 0 };
+             scansLeft: SCANS_PER_TICK, tilesLeft: TILES_PER_TICK, queue: [], pendingEvents: 0, dropsLeft: DROP_SCANS_PER_TICK };
 
     try {
         const context = await isolate.createContext();
@@ -123,6 +125,13 @@ async function startRuntime(s, api, getSnapshot, onStop) {
             rt.tilesLeft--;
             const radius = Math.min(Math.max(Math.trunc(Number(r)) || 0, 0), MAX_SCAN_RADIUS);
             return JSON.stringify(api.tiles(radius));
+        }));
+
+        await jail.set("__drops", new ivm.Callback((r) => {
+            if (rt.dropsLeft <= 0) return "[]";
+            rt.dropsLeft--;
+            const radius = Math.min(Math.max(Math.trunc(Number(r)) || 0, 0), MAX_SCAN_RADIUS);
+            return JSON.stringify(api.drops(radius));
         }));
 
         await (await isolate.compileScript(BOOTSTRAP)).run(context);
@@ -158,6 +167,7 @@ async function tickRuntime(id) {
     try {
         rt.scansLeft = SCANS_PER_TICK;
         rt.tilesLeft = TILES_PER_TICK;
+        rt.dropsLeft = DROP_SCANS_PER_TICK;
         await pushState(rt);
         await rt.loop.apply(undefined, [], { timeout: LOOP_TIMEOUT });
     } catch (e) {

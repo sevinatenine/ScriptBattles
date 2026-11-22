@@ -5,12 +5,52 @@ const container = document.getElementById("container");
 const scriptsList = document.getElementById("scriptsList");
 const editor = document.getElementById("editor");
 
-const statsEl = document.getElementById("stats-box");
+const leaderboardTable = document.getElementById("leaderboard-tbody");
 
-const codeToColor = document.querySelectorAll("color");
+const statsEl = document.getElementById("stats-tbody");
 
-function colorize(text) {
+const notificationsElem = document.getElementById("notificationsOverlay");
+var notifications = [];
 
+const NOTIFICATION_REMOVE_DELAY = 3000;
+const NOTIFICATION_ANIM_MS = 300;
+
+function dismissNotification(n) {
+    if (n.leaving) return;
+    n.leaving = true;
+    n.elem.classList.add("leaving");
+    setTimeout(() => {
+        n.elem.remove();
+        notifications = notifications.filter(e => e !== n);
+    }, NOTIFICATION_ANIM_MS);
+}
+
+function makeNotification(header, body) {
+    const elem = document.createElement("div");
+    elem.className = "notification";
+
+    const headerElem = document.createElement("span");
+    headerElem.textContent = header;
+    headerElem.classList.add("header");
+
+    const bodyElem = document.createElement("span");
+    bodyElem.textContent = body;
+    bodyElem.classList.add("body");
+
+    elem.append(headerElem, bodyElem);
+
+    var n = {
+        header,
+        body,
+        elem
+    };
+
+    notifications.push(n);
+
+    setTimeout(() => dismissNotification(n), NOTIFICATION_REMOVE_DELAY);
+    elem.addEventListener("click", () => dismissNotification(n));
+
+    notificationsElem.appendChild(elem);
 }
 
 const socket = io({ autoConnect: false });
@@ -39,6 +79,33 @@ const camera = {
     target: player,
     smoothing: 10
 };
+
+const KINDS = ["wanderer","crawler","skulker","brute","stalker","warden","reaver","revenant","colossus","horror", "player", "other"];
+
+var images = {
+    heart: "assets/heart.png",
+};
+
+for (var i of KINDS) {
+    images[i] = `assets/sprites/${i}.png`;
+    images[i + "_hit"] = `assets/sprites/${i}_hit.png`;
+}
+
+const loadedImages = {};
+
+function preloadImages() {
+    Object.entries(images).forEach(([name, url]) => {
+        const img = new Image();
+
+        img.src = url;
+
+        img.addEventListener("load", () => {
+            loadedImages[name] = img;
+        })
+    });
+}
+
+preloadImages();
 
 function resizeCanvas() {
     const dpr = window.devicePixelRatio || 1;
@@ -112,12 +179,28 @@ function drawGrid(x, y) {
     ctx.stroke();
 }
 
+function drawSprite(name, fallback, p, w, h) {
+    const img = loadedImages[name];
+    if (img) {
+        ctx.save();
+        ctx.imageSmoothingEnabled = img.width > w;
+        ctx.drawImage(img, Math.round(p.x - w / 2), Math.round(p.y - h / 2), Math.ceil(w), Math.ceil(h));
+        ctx.restore();
+    } else {
+        ctx.fillStyle = fallback;
+        ctx.fillRect(p.x - w / 2, p.y - h / 2, w, h);
+    }
+}
+
 function drawPlayer() {
     const p = worldToScreen(player.x, player.y);
     const w = CELL_WIDTH * camera.zoom;
     const h = CELL_HEIGHT * camera.zoom;
-    ctx.fillStyle = "#e33";
-    ctx.fillRect(p.x - w / 2, p.y - h / 2, w, h);
+
+    const me = entities.find(e => e.name === player.username);
+    const hit = me && (Date.now() - me.lastHit) <= HIT_DURATION;
+
+    drawSprite(hit ? "player_hit" : "player", hit ? "#f88" : "#e33", p, w, h);
 }
 
 new ResizeObserver(resizeCanvas).observe(canvas);
@@ -125,7 +208,6 @@ new ResizeObserver(resizeCanvas).observe(canvas);
 let entities = [];
 socket.on("entities", (list) => { entities = list; });
 
-const KINDS = ["wanderer","crawler","skulker","brute","stalker","warden","reaver","revenant","colossus","horror"];
 const BOT_FALLBACK = { color: "#888", hit: "#fff" };
 
 function botColors(kind) {
@@ -153,13 +235,15 @@ const HIT_DURATION = 400;
 function drawEntities() {
     const w = CELL_WIDTH * camera.zoom, h = CELL_HEIGHT * camera.zoom;
     for (const e of entities) {
-        const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
-
         if (e.name === player.username) continue;
-    
-        ctx.fillStyle = entityColors(e);
 
-        ctx.fillRect(p.x - w / 2, p.y - h / 2, w, h);
+        const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
+        const hit = (Date.now() - e.lastHit) <= HIT_DURATION;
+
+        const kind = e.type === "bot" ? e.kind : "other";
+        const name = kind + (hit ? "_hit" : "");
+
+        drawSprite(name, entityColors(e), p, w, h);
     }
     for (const e of entities) {
         const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
@@ -167,7 +251,38 @@ function drawEntities() {
         if (e.hp < e.maxHp) {
             drawHpBar(p.x, p.y, w, h, (e.hp / e.maxHp))
         }
+
+        drawName(p.x, p.y, h, e.type === "bot" ? (e.kind[0].toUpperCase() + e.kind.slice(1)) : e.name, e.type === "bot" ? "gray" : "white");
     }
+}
+
+function drawDrops() {
+    const cell = CELL_WIDTH * camera.zoom;
+    const box = cell * 0.6;
+    const bob = Math.sin(Date.now() / 300) * cell * 0.04;
+
+    ctx.save();
+    for (const d of drops) {
+        const img = loadedImages[d.kind];
+        if (!img) continue;
+
+        const scale = box / Math.max(img.width, img.height);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+
+        ctx.imageSmoothingEnabled = img.width > 64;
+        ctx.imageSmoothingQuality = "high";
+
+        const p = worldToScreen((d.x + 0.5) * CELL_WIDTH, (d.y + 0.5) * CELL_HEIGHT);
+
+        ctx.fillStyle = "rgba(0,0,0,0.2)";
+        ctx.beginPath();
+        ctx.ellipse(p.x, p.y + box * 0.45, box * 0.3, box * 0.1, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.drawImage(img, Math.round(p.x - w / 2), Math.round(p.y - h / 2 + bob), w, h);
+    }
+    ctx.restore();
 }
 
 const WALL_COLOR = "#333";
@@ -194,6 +309,37 @@ function drawWalls() {
 }
 
 var walls = [];
+var drops = [];
+
+var leaderboard = { top: [], me: null };
+
+function updateLeaderboard() {
+    const { top = [], me = null } = leaderboard;
+    leaderboardTable.replaceChildren();
+
+    const addRow = (e) => {
+        const tr = document.createElement("tr");
+        if (e.name === player.username) tr.style.fontWeight = "bold";
+        for (const v of [e.rank, e.name, e.level, e.xp]) {
+            const td = document.createElement("td");
+            td.textContent = v;
+            tr.appendChild(td);
+        }
+        leaderboardTable.appendChild(tr);
+    };
+
+    top.forEach(addRow);
+
+    if (me && !top.some(e => e.name === me.name)) {
+        const gap = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.textContent = "…";
+        gap.appendChild(td);
+        leaderboardTable.appendChild(gap);
+        addRow(me);
+    }
+}
 
 const MAP_X_OFFSET = -150;
 const MAP_Y_OFFSET = -150;
@@ -218,6 +364,7 @@ function draw(now) {
     drawGrid(origin.x, origin.y);
     drawPlayer();
     drawEntities();
+    drawDrops();
 
     requestAnimationFrame(draw);
 }
@@ -282,6 +429,17 @@ socket.on("scriptStopped", (data) => {
 
 });
 
+socket.on("notify", (data) => {
+    const { header, body } = data ?? {};
+    if (!header || !body) return;
+    makeNotification(header, body);
+});
+
+socket.on("leaderboard", (l) => {
+    leaderboard = l;
+    updateLeaderboard();
+})
+
 let stats = { level: 1, xp: 0, next: 50, hp: -1 };
 
 const XP_PER_LEVEL = 50;
@@ -290,13 +448,10 @@ const damageFor = (xp) => 10 + 2 * (levelFor(xp) - 1);
 
 function renderStats() {
     statsEl.innerHTML =
-        `Level ${stats.level} · ${stats.xp}/${stats.next} XP` +
-        '<br>' + 
-        `Position (${player.col}, ${player.row})` + 
-        '<br>' +
-        `HP ${stats.hp}/${stats.maxHp}` + 
-        '<br>' +
-        `Damage ${damageFor(stats.xp)}`;
+        `<tr><td style="font-weight: bold;">Level</td><td>${stats.level} · ${stats.xp}/${stats.next} XP</td>` +
+        `<tr><td style="font-weight: bold;">Position</td><td>(${player.col}, ${player.row})</td>` + 
+        `<tr><td style="font-weight: bold;">HP</td><td>${stats.hp}/${stats.maxHp}</td>` + 
+        `<tr><td style="font-weight: bold;">Damage</td><td>${damageFor(stats.xp)}</td>`;
 }
 
 function drawHpBar(cx, cy, w, h, frac) {
@@ -307,8 +462,29 @@ function drawHpBar(cx, cy, w, h, frac) {
     ctx.fillStyle = "#0b0"; ctx.fillRect(x, y, bw * Math.max(0, frac), bh);
 }
 
+function drawName(cx, cy, h, name, color = "#fff") {
+    if (!name || camera.zoom < 0.5) return;
+
+    const bh = Math.max(3, 5 * camera.zoom);
+    const size = Math.min(18, Math.max(11, 13 * camera.zoom));
+    const y = cy - h / 2 - bh - 5;
+
+    ctx.save();
+    ctx.font = `${size}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(0,0,0,0.7)";
+    ctx.fillStyle = color;
+    ctx.strokeText(name, cx, y);
+    ctx.fillText(name, cx, y);
+    ctx.restore();
+}
+
 socket.on("stats", (s) => { stats = s; renderStats(); });
 socket.on("walls", (w) => { walls = w; })
+socket.on("drops", (d) => { drops = d; })
 socket.on("playerMove", ({ col, row }) => { player.col = col; player.row = row; renderStats(); });
 
 let selectedId = null;

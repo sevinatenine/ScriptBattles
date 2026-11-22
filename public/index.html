@@ -95,28 +95,165 @@
     #apiRef code, #apiRef pre { font-family: monospace; background: #f0f0f0; }
     #apiRef pre { padding: 8px; border-radius: 4px; overflow-x: auto; }
 
-    #editorWrap { position: relative; flex: 1; min-height: 0; }
+    #editorWrap { position: relative; flex: 1; min-height: 0; border: none; }
     #editorWrap pre, #editorWrap textarea {
         position: absolute; inset: 0; margin: 0; padding: 8px; border: 1px solid black;
         font: 13px/1.4 monospace; white-space: pre; overflow: auto; tab-size: 4; box-sizing: border-box;
     }
-    #hl { pointer-events: none; }
+    #editorWrap { isolation: isolate; }
+
+    #hl { pointer-events: none; z-index: 1; border: none !important; }
     #hl code { padding: 0 !important; background: none !important; }
-    #editor { background: transparent; color: transparent; caret-color: black; resize: none; }
+
+    #editor {
+        z-index: 2;
+        background: transparent;
+        color: transparent;
+        caret-color: black;
+        resize: none;
+        border-radius: 5px;
+    }
+
+    #editor:disabled {
+        background-color: lightgray;
+    }
+
+    #notificationsOverlay {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        z-index: 50;
+        position: fixed;
+        left: 50vw;
+        top: 0;
+        width: calc(20vw - 30px);
+        height: 100vh;
+        overflow: hidden;
+        pointer-events: none;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .notification {
+        padding: 10px;
+        width: 100%;
+        border: 1px solid black;
+        display: flex;
+        flex-direction: column;
+        background-color: #b2b2b2;
+        box-sizing: border-box;
+        pointer-events: auto;
+    }
+
+    .notification .header {
+        font-weight: bold;
+        font-size: 25px;
+    }
+
+    #overlay { z-index: 100; }
+
+    .notification {
+        animation: notifIn 300ms ease-out;
+    }
+
+    .notification.leaving {
+        animation: notifOut 300ms ease-in forwards;
+    }
+
+    @keyframes notifIn {
+        from { transform: translateX(120%); opacity: 0; }
+        to   { transform: translateX(0);    opacity: 1; }
+    }
+
+    @keyframes notifOut {
+        from { transform: translateX(0);    opacity: 1; }
+        to   { transform: translateX(120%); opacity: 0; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .notification, .notification.leaving { animation-duration: 1ms; }
+    }
+
+    #info-box {
+        display: flex;
+        gap: 10px;
+    }
+
+    #stats {
+
+    }
+
+    #leaderboard {
+        flex: 1;
+    }
+
+    #hl code, #hl code.hljs {
+        display: inline;          /* github.css makes it a block with its own scrollbar */
+        overflow: visible;
+        padding: 0 !important;
+        background: none !important;
+    }
+
+    #editorWrap pre, #editorWrap textarea {
+        scrollbar-gutter: stable; /* both layers always agree on scrollbar width */
+        overflow-wrap: normal;
+        word-break: normal;
+    }
+
+    #stats-box {
+        border: 1px solid black;
+        padding: 10px;
+        border-radius: 5px;
+    }
+
+    #leaderboard-box {
+        border: 1px solid black;
+        padding: 10px;
+        border-radius: 5px;
+    }
+
+    #leaderboard {
+        flex: 1;
+    }
+
+    #leaderboard-table {
+        width: 100%;
+    }
+
+    #leaderboard-table td {
+        text-align: center;
+    }
+
+    #stats-tbody tr td:nth-child(1) {
+        padding-right: 10px;
+    }
 
     </style>
     <link rel="stylesheet" href="/lib/highlight.js/styles/github.css">
-
-
 </head>
 <body>
     <div id="container">
         <canvas id="game">
         </canvas>
         <div id="side">
-            <div id="stats">
-                <h1>Stats</h1>
-                <div id="stats-box"></div>
+            <div id="info-box">
+                <div id="stats">
+                    <h1>Stats</h1>
+                    <div id="stats-box">
+                        <table id="stats-table">
+                            <tbody id="stats-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div id="leaderboard">
+                    <h1>Leaderboard</h1>
+                    <div id="leaderboard-box">
+                        <table id="leaderboard-table">
+                            <thead><tr><th>#</th><th>Name</th><th>Lv</th><th>XP</th></tr></thead>
+                            <tbody id="leaderboard-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
 
             <div id="scripts">
@@ -135,6 +272,9 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <div id="notificationsOverlay">
     </div>
 
     <form id="loginForm" action="/login" method="post" hidden>
@@ -197,7 +337,8 @@ world.tiles(radius)        // 2 calls per tick
 world.scan(radius)         // entities within radius
 world.players(radius?)     // type "user"
 world.bots(radius?)        // type "bot"
-world.entities(radius?)    // everything</code></pre>
+world.entities(radius?)    // everything
+world.drops(radius?)  // hearts etc. on the ground</code></pre>
                     <p>Without a radius, <code>players/bots/entities</code> filter <code>world.vision</code> for free.
                     With a radius they run a scan: <b>2 scans per tick</b>, max radius <b>20</b>.</p>
 
