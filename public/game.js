@@ -7,6 +7,12 @@ const editor = document.getElementById("editor");
 
 const statsEl = document.getElementById("stats-box");
 
+const codeToColor = document.querySelectorAll("color");
+
+function colorize(text) {
+
+}
+
 const socket = io({ autoConnect: false });
 
 let width = 0;
@@ -119,8 +125,27 @@ new ResizeObserver(resizeCanvas).observe(canvas);
 let entities = [];
 socket.on("entities", (list) => { entities = list; });
 
-const BOT = "#36c";
-const BOT_HIT = "#00eeff";
+const KINDS = ["wanderer","crawler","skulker","brute","stalker","warden","reaver","revenant","colossus","horror"];
+const BOT_FALLBACK = { color: "#888", hit: "#fff" };
+
+function botColors(kind) {
+    const i = KINDS.indexOf(kind);
+    if (i < 0) return BOT_FALLBACK;
+    const hue = 210 + i * (150 / 9);
+    return { color: `hsl(${hue}, 65%, 45%)`, hit: `hsl(${hue}, 100%, 70%)` };
+}
+
+function entityColors(e) {
+    const hit = (Date.now() - e.lastHit) <= HIT_DURATION;
+    if (e.type === "bot") {
+        const c = botColors(e.kind) ?? BOT_FALLBACK;
+        return hit ? c.hit : c.color;
+    }
+    return hit ? PLAYER_HIT : PLAYER;
+}
+
+// const BOT = "#36c";
+// const BOT_HIT = "#00eeff";
 const PLAYER = "#3a3";
 const PLAYER_HIT = "rgb(0, 255, 0)";
 const HIT_DURATION = 400;
@@ -128,11 +153,56 @@ const HIT_DURATION = 400;
 function drawEntities() {
     const w = CELL_WIDTH * camera.zoom, h = CELL_HEIGHT * camera.zoom;
     for (const e of entities) {
-        if (e.name === player.username) continue;
         const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
-        ctx.fillStyle = e.type === "bot" ? ((Date.now() - e.lastHit) > HIT_DURATION ? BOT : BOT_HIT) : ((Date.now() - e.lastHit) > HIT_DURATION ? PLAYER : PLAYER_HIT);
+
+        if (e.name === player.username) continue;
+    
+        ctx.fillStyle = entityColors(e);
+
         ctx.fillRect(p.x - w / 2, p.y - h / 2, w, h);
     }
+    for (const e of entities) {
+        const p = worldToScreen((e.col + 0.5) * CELL_WIDTH, (e.row + 0.5) * CELL_HEIGHT);
+        
+        if (e.hp < e.maxHp) {
+            drawHpBar(p.x, p.y, w, h, (e.hp / e.maxHp))
+        }
+    }
+}
+
+const WALL_COLOR = "#333";
+
+function drawWalls() {
+    if (!walls.length) return;
+
+    const tl = screenToWorld(0, 0);
+    const br = screenToWorld(width, height);
+    const c0 = Math.floor(tl.x / CELL_WIDTH),  c1 = Math.floor(br.x / CELL_WIDTH);
+    const r0 = Math.floor(tl.y / CELL_HEIGHT), r1 = Math.floor(br.y / CELL_HEIGHT);
+
+    const w = CELL_WIDTH * camera.zoom, h = CELL_HEIGHT * camera.zoom;
+
+    ctx.fillStyle = WALL_COLOR;
+    for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+            if (!wallAt(c, r)) continue;
+            const p = worldToScreen(c * CELL_WIDTH, r * CELL_HEIGHT);
+
+            ctx.fillRect(Math.floor(p.x), Math.floor(p.y), Math.ceil(w) + 1, Math.ceil(h) + 1);
+        }
+    }
+}
+
+var walls = [];
+
+const MAP_X_OFFSET = -150;
+const MAP_Y_OFFSET = -150;
+
+function wallAt(col, row) {
+    const x = col - MAP_X_OFFSET;
+    const y = row - MAP_Y_OFFSET;
+    if (y < 0 || x < 0 || y >= walls.length || x >= (walls[0]?.length ?? 0)) return true; // out of bounds = solid
+    return walls[y][x] !== 0;
 }
 
 let last = performance.now();
@@ -143,7 +213,7 @@ function draw(now) {
     updateCamera(dt);
 
     ctx.clearRect(0, 0, width, height);
-
+    drawWalls();
     const origin = worldToScreen(0, 0);
     drawGrid(origin.x, origin.y);
     drawPlayer();
@@ -197,10 +267,6 @@ function reloadScripts() {
     }
 }
 
-function createScript() {
-    
-}
-
 function toggleRun(id) {
     socket.emit("toggleScript", id);
 }
@@ -216,15 +282,33 @@ socket.on("scriptStopped", (data) => {
 
 });
 
-let stats = { level: 1, xp: 0, next: 50 };
+let stats = { level: 1, xp: 0, next: 50, hp: -1 };
+
+const XP_PER_LEVEL = 50;
+const levelFor = (xp) => 1 + Math.floor(Math.sqrt((xp ?? 0) / XP_PER_LEVEL));
+const damageFor = (xp) => 10 + 2 * (levelFor(xp) - 1);
 
 function renderStats() {
-    statsEl.textContent =
-        `Level ${stats.level} · ${stats.xp}/${stats.next} XP\n` +
-        `Position (${player.col}, ${player.row})`;
+    statsEl.innerHTML =
+        `Level ${stats.level} · ${stats.xp}/${stats.next} XP` +
+        '<br>' + 
+        `Position (${player.col}, ${player.row})` + 
+        '<br>' +
+        `HP ${stats.hp}/${stats.maxHp}` + 
+        '<br>' +
+        `Damage ${damageFor(stats.xp)}`;
+}
+
+function drawHpBar(cx, cy, w, h, frac) {
+    if (!(frac < 1)) return;
+    const bw = w * 0.8, bh = Math.max(3, 5 * camera.zoom);
+    const x = cx - bw / 2, y = cy - h / 2 - bh - 2;
+    ctx.fillStyle = "#900"; ctx.fillRect(x, y, bw, bh);
+    ctx.fillStyle = "#0b0"; ctx.fillRect(x, y, bw * Math.max(0, frac), bh);
 }
 
 socket.on("stats", (s) => { stats = s; renderStats(); });
+socket.on("walls", (w) => { walls = w; })
 socket.on("playerMove", ({ col, row }) => { player.col = col; player.row = row; renderStats(); });
 
 let selectedId = null;
@@ -236,6 +320,7 @@ function selectScript(id) {
     const s = player.scripts.find(x => x.id === id);
     editor.disabled = !s;
     editor.value = s ? s.script : "";
+    window.refreshHighlight?.();
     reloadScripts();
 }
 
@@ -269,7 +354,10 @@ socket.on("scriptData", (s) => {
 
     if (isNew && selectNext) { selectNext = false; selectScript(s.id); return; }
 
-    if (s.id === selectedId && document.activeElement !== editor) editor.value = s.script;
+    if (s.id === selectedId && document.activeElement !== editor) {
+        editor.value = s.script;
+        window.refreshHighlight?.();
+    }
     reloadScripts();
 });
 

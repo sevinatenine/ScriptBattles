@@ -18,6 +18,10 @@ const isActive = (u) => online.has(u.username) || u.data.scripts?.some(s => s.st
 
 app.use(express.static(path.join(__dirname, '../public')));
 
+const hljsDir = path.join(__dirname, '../node_modules/@highlightjs/cdn-assets');
+app.use('/lib/highlight.js/styles/', express.static(path.join(hljsDir, 'styles')));
+app.use('/lib/highlight.js/', express.static(path.join(hljsDir, 'es')));
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 const DATA_DIR = path.join(__dirname, "../data");
@@ -33,7 +37,126 @@ function load(f) {
 
 const accounts = load("accounts.json");
 const users = load("users.json");
-const bots = load("bots.json").map(b => ({ ...b, maxHp: b.hp, spawn: { col: b.col, row: b.row } }));
+var walls = load("walls.json");
+
+const MAP_X_OFFSET = -150;
+const MAP_Y_OFFSET = -150;
+const MAP_SIZE = 301;
+
+const SPAWN = { col: 0, row: 0 };
+const SPAWN_PROTECTION_TICKS = 10;
+const TIERS = [
+    { kind: "wanderer", maxDist: 15,       hp: 30,   xp: 50,   damage: 0,  ai: "wander",    moveChance: 0.3 },
+    { kind: "crawler",  maxDist: 30,       hp: 50,   xp: 80,   damage: 0,  ai: "skittish",  moveChance: 0.4, fleeRadius: 3 },
+    { kind: "skulker",  maxDist: 45,       hp: 80,   xp: 130,  damage: 0,  ai: "skittish",  moveChance: 0.5, fleeRadius: 4 },
+    { kind: "brute",    maxDist: 60,       hp: 120,  xp: 200,  damage: 6,  ai: "retaliate", moveChance: 0.3, leash: 10, chaseEvery: 3, attackEvery: 6 },
+    { kind: "stalker",  maxDist: 75,       hp: 180,  xp: 320,  damage: 9,  ai: "retaliate", moveChance: 0.3, leash: 12, chaseEvery: 2, attackEvery: 5 },
+    { kind: "warden",   maxDist: 90,       hp: 260,  xp: 500,  damage: 12, ai: "aggro",     moveChance: 0.3, leash: 12, chaseEvery: 3, attackEvery: 5, aggroRadius: 5 },
+    { kind: "reaver",   maxDist: 105,      hp: 380,  xp: 800,  damage: 16, ai: "aggro",     moveChance: 0.3, leash: 14, chaseEvery: 2, attackEvery: 5, aggroRadius: 6 },
+    { kind: "revenant", maxDist: 120,      hp: 550,  xp: 1250, damage: 21, ai: "hunter",    moveChance: 0.3, leash: 20, chaseEvery: 2, attackEvery: 4, aggroRadius: 9 },
+    { kind: "colossus", maxDist: 135,      hp: 800,  xp: 2000, damage: 27, ai: "guard",     leash: 6,  chaseEvery: 2, attackEvery: 8, aggroRadius: 4 },
+    { kind: "horror",   maxDist: Infinity, hp: 1200, xp: 3200, damage: 35, ai: "hunter",    moveChance: 0.3, leash: 25, chaseEvery: 1, attackEvery: 4, aggroRadius: 12 },
+];
+
+const SAFE_RADIUS = 6;   // no bots right on top of the player spawn
+
+const tierFor = (col, row) => {
+    const d = Math.hypot(col - SPAWN.col, row - SPAWN.row);
+    return TIERS.find(t => d <= t.maxDist);
+};
+
+const bots = load("bots.json")
+    .filter(b => Math.hypot(b.col - SPAWN.col, b.row - SPAWN.row) > SAFE_RADIUS)
+        .map((b, i) => {
+        const { maxDist, ...stats } = tierFor(b.col, b.row);
+        return { id: b.id, col: b.col, row: b.row, spawn: { col: b.col, row: b.row },
+                ...stats, maxHp: stats.hp, phase: i };
+    });;
+
+if (!Array.isArray(walls) || walls.length !== MAP_SIZE || walls.some(r => !Array.isArray(r) || r.length !== MAP_SIZE)) {
+    walls = [];
+    for (let y = 0; y < MAP_SIZE; y++) {
+        const row = [];
+        for (let x = 0; x < MAP_SIZE; x++) {
+            const isBorder = y === 0 || y === MAP_SIZE - 1 || x === 0 || x === MAP_SIZE - 1;
+            row.push(isBorder ? 1 : 0);
+        }
+        walls.push(row);
+    }
+}
+
+const GEN_WALL_CHANCE = 0.45;
+const GEN_SMOOTH_ITER = 3;
+
+function regenMap() {
+    var grid = [];
+
+    function countWallsAround(grid, x, y) {
+        let count = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            const ny = y + dy;
+
+            if (nx < 0 || ny < 0 || nx >= MAP_SIZE || ny >= MAP_SIZE) {
+                count++;
+            } else {
+                count += grid[ny][nx];
+            }
+            }
+        }
+        return count;
+    }
+
+    function smooth() {
+        return grid.map((row, y) =>
+            row.map((_, x) => {
+                const walls = countWallsAround(grid, x, y);
+                return walls >= 5 ? 1 : 0;
+            })
+        );
+    }
+
+    for (var y = 0; y < MAP_SIZE; y++) {
+        const row = [];
+        for (let x = 0; x < MAP_SIZE; x++) {
+            row.push((Math.random() < GEN_WALL_CHANCE) ? 1 : 0);
+        }
+        grid.push(row);
+    }
+
+    for (var i = 0; i < GEN_SMOOTH_ITER; i++) {
+        grid = smooth(grid);
+    }
+
+    return grid;
+}
+
+function finalizeMap(grid) {
+    const sx = SPAWN.col - MAP_X_OFFSET, sy = SPAWN.row - MAP_Y_OFFSET;
+    for (let dy = -3; dy <= 3; dy++)
+        for (let dx = -3; dx <= 3; dx++) grid[sy + dy][sx + dx] = 0;
+
+    for (let i = 0; i < MAP_SIZE; i++)
+        grid[0][i] = grid[MAP_SIZE-1][i] = grid[i][0] = grid[i][MAP_SIZE-1] = 1;
+
+    const seen = Array.from({ length: MAP_SIZE }, () => new Uint8Array(MAP_SIZE));
+    const stack = [[sx, sy]];
+    seen[sy][sx] = 1;
+    while (stack.length) {
+        const [x, y] = stack.pop();
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+            const nx = x + dx, ny = y + dy;
+            if (grid[ny]?.[nx] !== 0 || seen[ny][nx]) continue;
+            seen[ny][nx] = 1;
+            stack.push([nx, ny]);
+        }
+    }
+    for (let y = 0; y < MAP_SIZE; y++)
+        for (let x = 0; x < MAP_SIZE; x++)
+            if (!seen[y][x]) grid[y][x] = 1;
+    return grid;
+}
 
 const RESPAWN_TICKS = 25;
 const liveBots = () => bots.filter(b => !b.dead);
@@ -42,24 +165,145 @@ const XP_PER_LEVEL = 50;
 const levelFor = (xp) => 1 + Math.floor(Math.sqrt((xp ?? 0) / XP_PER_LEVEL));
 const damageFor = (user) => 10 + 2 * (levelFor(user.data.xp) - 1);
 
+const BASE_HP = 100;
+const maxHpFor = (user) => BASE_HP + 10 * (levelFor(user.data.xp) - 1);
+const hpOf = (user) => user.data.hp ?? maxHpFor(user);
+const colOf = (u) => u.data.col ?? 0;
+const rowOf = (u) => u.data.row ?? 0;
+
 const statsOf = (user) => {
     const xp = user.data.xp ?? 0, level = levelFor(xp);
-    return { xp, level, next: XP_PER_LEVEL * level ** 2 };
+    return { xp, level, next: XP_PER_LEVEL * level ** 2, hp: hpOf(user), maxHp: maxHpFor(user) };
 };
+const sendStats = (user) => io.to(user.username).emit("stats", statsOf(user));
 
 function giveXp(user, amount) {
     user.data.xp = (user.data.xp ?? 0) + amount;
     dirty = true;
-    io.to(user.username).emit("stats", statsOf(user));
+    sendStats(user);
+}
+
+const nearestPlayer = (b, radius) => {
+    let best = null, bestD = radius;
+    for (const u of users) {
+        if (!isActive(u)) continue;
+        if ((protectedUntil.get(u.username) ?? 0) > tick) continue;
+        const d = Math.hypot(colOf(u) - b.col, rowOf(u) - b.row);
+        if (d <= bestD) { best = u; bestD = d; }
+    }
+    return best;
+};
+
+function stepToward(b, tc, tr) {
+    const dx = Math.sign(tc - b.col), dy = Math.sign(tr - b.row);
+
+    const options = Math.abs(tc - b.col) >= Math.abs(tr - b.row)
+        ? [[dx, 0], [0, dy]] : [[0, dy], [dx, 0]];
+    for (const [sx, sy] of options) {
+        if (!sx && !sy) continue;
+        const nc = b.col + sx, nr = b.row + sy;
+        if (!isWall(nc, nr) && !occupied(nc, nr)) { b.col = nc; b.row = nr; return true; }
+    }
+    return false;
+}
+
+function hurt(victim, dmg) {
+    if (!victim) return false;
+    if ((protectedUntil.get(victim.username) ?? 0) > tick) return false;
+
+    victim.data.hp = hpOf(victim) - dmg;
+    victim.lastHit = Date.now();
+    dirty = true;
+
+    if (victim.data.hp <= 0) {
+        respawn(victim);
+    } else {
+        sendStats(victim);
+    }
+
+    return true;
+}
+
+const distFromSpawn = (b) => Math.hypot(b.col - b.spawn.col, b.row - b.spawn.row);
+const adjacent = (b, u) => Math.abs(colOf(u) - b.col) + Math.abs(rowOf(u) - b.row) === 1;
+const stepsNow = (b, every) => (tick + b.phase) % (every ?? 1) === 0;
+
+function heal(b) {
+    if (tick % 5 === 0 && b.hp < b.maxHp) b.hp = Math.min(b.maxHp, b.hp + Math.ceil(b.maxHp * 0.05));
+}
+
+function idleStep(b) {
+    if (Math.random() > (b.moveChance ?? 0.3)) return;
+    const d = Object.values(DIRS)[Math.floor(Math.random() * 4)];
+    const nc = b.col + d[0], nr = b.row + d[1];
+    if (Math.abs(nc - b.spawn.col) > 6 || Math.abs(nr - b.spawn.row) > 6) return;
+    if (isWall(nc, nr) || occupied(nc, nr)) return;
+    b.col = nc; b.row = nr;
+}
+
+// returns true once home. Walks at full speed and heals on the way.
+function goHome(b, tol = 1.5) {
+    if (distFromSpawn(b) <= tol) return true;
+    heal(b);
+    if (!stepToward(b, b.spawn.col, b.spawn.row)) idleStep(b);   // unstick if blocked
+    return false;
+}
+
+function chase(b, target) {
+    if (adjacent(b, target)) {
+        if (tick >= (b.nextAttack ?? 0)) { hurt(target, b.damage); b.nextAttack = tick + (b.attackEvery ?? 5); }
+    } else if (stepsNow(b, b.chaseEvery ?? 2)) {
+        stepToward(b, colOf(target), rowOf(target));
+    }
 }
 
 const BOT_AI = {
     idle() {},
-    wander(b) {
-        if (Math.random() > 0.3) return;
-        const d = Object.values(DIRS)[Math.floor(Math.random() * 4)];
-        if (Math.abs(b.col + d[0] - b.spawn.col) > 6 || Math.abs(b.row + d[1] - b.spawn.row) > 6) return;
-        b.col += d[0]; b.row += d[1];
+
+    wander(b) { idleStep(b); },
+
+    skittish(b) {
+        const threat = nearestPlayer(b, b.fleeRadius ?? 3);
+        if (threat && distFromSpawn(b) <= (b.leash ?? 8)) {
+            if (stepsNow(b, b.chaseEvery ?? 2))
+                stepToward(b, 2 * b.col - colOf(threat), 2 * b.row - rowOf(threat));;
+            return;
+        }
+        if (distFromSpawn(b) > 6) return void goHome(b);
+        idleStep(b);
+    },
+
+    retaliate(b) {
+        if (b.returning) { if (goHome(b)) b.returning = false; return; }
+        const target = b.lastAttacker && tick < (b.aggroUntil ?? 0)
+            ? users.find(u => u.username === b.lastAttacker && isActive(u)) : null;
+        if (!target) return idleStep(b);
+        if (distFromSpawn(b) > (b.leash ?? 10)) { b.returning = true; b.lastAttacker = null; return; }
+        chase(b, target);
+    },
+
+    aggro(b) {
+        if (b.returning) { if (goHome(b)) b.returning = false; return; }
+        const target = nearestPlayer(b, b.aggroRadius ?? 6);
+        if (!target) return idleStep(b);
+        if (distFromSpawn(b) > (b.leash ?? 12)) { b.returning = true; return; }
+        chase(b, target);
+    },
+
+    hunter(b) {
+        if (b.returning) { if (goHome(b)) b.returning = false; return; }
+        let target = nearestPlayer(b, b.aggroRadius ?? 10);
+        if (target) { b.hunting = target.username; b.huntUntil = tick + 25; }
+        else if (tick < (b.huntUntil ?? 0)) target = users.find(u => u.username === b.hunting && isActive(u));
+        if (!target) return idleStep(b);
+        if (distFromSpawn(b) > (b.leash ?? 20)) { b.returning = true; b.huntUntil = 0; return; }
+        chase(b, target);
+    },
+
+    guard(b) {
+        const target = nearestPlayer(b, b.aggroRadius ?? 4);
+        if (target && distFromSpawn(b) <= (b.leash ?? 6)) return chase(b, target);
+        goHome(b, 0.5);
     },
 };
 
@@ -81,6 +325,7 @@ function flush() {
     dirty = false;
     writeAtomic("accounts.json", accounts);
     writeAtomic("users.json", users);
+    writeAtomic("walls.json", walls);
 }
 
 setInterval(flush, 1000);
@@ -146,7 +391,7 @@ function nearby(user, radius, type) {
     const px = user.data.col ?? 0, py = user.data.row ?? 0;
     return [
         ...(type === "bot" ? [] : users.filter(u => u !== user && isActive(u)).map(u => ({
-            type: "user", name: u.username, x: u.data.col ?? 0, y: u.data.row ?? 0, hp: u.data.hp ?? 100 }))),
+            type: "user", name: u.username, x: u.data.col ?? 0, y: u.data.row ?? 0, hp: hpOf(u) }))),
         ...(type === "user" ? [] : liveBots().map(b => ({
             type: "bot", kind: b.kind, name: b.id, x: b.col, y: b.row, hp: b.hp }))),
     ]
@@ -157,16 +402,29 @@ function nearby(user, radius, type) {
 }
 
 function makeApi(user) {
+    const pos = () => [user.data.col ?? 0, user.data.row ?? 0];
     return {
         log: (msg) => console.log(`[${user.username}]`, msg),
         scan: (radius, type) => nearby(user, radius, type),
+        wall: (dx, dy) => { const [c, r] = pos(); return isWall(c + dx, r + dy); },
+        tiles: (radius) => {
+            const [c, r] = pos();
+            const out = [];
+            for (let dy = -radius; dy <= radius; dy++) {
+                const row = [];
+                for (let dx = -radius; dx <= radius; dx++) row.push(isWall(c + dx, r + dy) ? 1 : 0);
+                out.push(row);
+            }
+            return out;
+        },
     };
 }
+
 const makeSnapshot = (user) => () => {
     const near = nearby(user, 5);
     return {
         tick,
-        player: { x: user.data.col ?? 0, y: user.data.row ?? 0, hp: user.data.hp ?? 100, xp: user.data.xp ?? 0, level: levelFor(user.data.xp) },
+        player: { x: user.data.col ?? 0, y: user.data.row ?? 0, hp: hpOf(user), maxHp: maxHpFor(user), xp: user.data.xp ?? 0, level: levelFor(user.data.xp) },
         vision: near,
         nearestPlayerDistance: near.find(e => e.type === "user")?.dist ?? null,
     };
@@ -174,44 +432,118 @@ const makeSnapshot = (user) => () => {
 
 const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
 
+function isWall(col, row) {
+    const x = col - MAP_X_OFFSET;
+    const y = row - MAP_Y_OFFSET;
+    if (x < 0 || y < 0 || x >= MAP_SIZE || y >= MAP_SIZE) return true;
+    return walls[y][x] !== 0;
+}
+
+function nearestTileOpen(row, col, { avoidOccupied = true } = {}) {
+    const lo = MAP_X_OFFSET, hi = MAP_X_OFFSET + MAP_SIZE - 1;
+    col = Math.min(hi, Math.max(lo, col));
+    row = Math.min(hi, Math.max(lo, row));
+
+    const seen = new Set([`${col},${row}`]);
+    const queue = [[col, row]];
+
+    for (let i = 0; i < queue.length; i++) {
+        const [c, r] = queue[i];
+        if (!isWall(c, r) && !(avoidOccupied && occupied(c, r))) return [c, r];
+
+        for (const [dx, dy] of Object.values(DIRS)) {
+            const nc = c + dx, nr = r + dy;
+            if (nc < lo || nc > hi || nr < lo || nr > hi) continue;
+            const k = `${nc},${nr}`;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            queue.push([nc, nr]);
+        }
+    }
+    return null;
+}
+
+const KILL_XP_BASE = 10;
+const protectedUntil = new Map();
+
+function occupied(col, row, except) {
+    return liveBots().some(b => b.col === col && b.row === row)
+        || users.some(u => u !== except && isActive(u) && colOf(u) === col && rowOf(u) === row);
+}
+
+function freeTileNear(col, row) {
+    for (let r = 0; r <= 10; r++)
+        for (let dy = -r; dy <= r; dy++)
+            for (let dx = -r; dx <= r; dx++) {
+                if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+                if (!isWall(col + dx, row + dy) && !occupied(col + dx, row + dy)) return [col + dx, row + dy];
+            }
+    return [col, row];
+}
+
+function respawn(user) {
+    const [c, r] = nearestTileOpen(SPAWN.row, SPAWN.col) ?? [SPAWN.col, SPAWN.row];
+    user.data.hp = maxHpFor(user);
+    user.data.col = c;
+    user.data.row = r;
+    protectedUntil.set(user.username, tick + SPAWN_PROTECTION_TICKS);
+    dirty = true;
+    io.to(user.username).emit("playerMove", { col: c, row: r });
+    sendStats(user);
+}
+
+function strike(user, tx, ty) {
+    const bot = liveBots().find(b => b.col === tx && b.row === ty);
+    if (bot) {
+        bot.hp -= damageFor(user);
+        bot.lastHit = Date.now();
+        bot.lastAttacker = user.username;
+        bot.aggroUntil = tick + 40;
+        if (bot.hp <= 0) {
+            bot.dead = true;
+            bot.respawnAt = tick + RESPAWN_TICKS;
+            giveXp(user, bot.xp ?? 0);
+        }
+        return true;
+    }
+
+    const victim = users.find(u => u !== user && isActive(u) && colOf(u) === tx && rowOf(u) === ty);
+    if (!victim) return false;
+    if ((protectedUntil.get(victim.username) ?? 0) > tick) return false;
+
+    victim.data.hp = hpOf(victim) - damageFor(user);
+    victim.lastHit = Date.now();
+    dirty = true;
+    if (victim.data.hp <= 0) {
+        giveXp(user, KILL_XP_BASE + Math.floor((victim.data.xp ?? 0) * 0.1));
+        respawn(victim);
+    } else {
+        sendStats(victim);
+    }
+    return true;
+}
+
 const ACTIONS = {
     move(user, arg) {
         const d = DIRS[arg];
-        if (!d) return;
-        user.data.col = (user.data.col ?? 0) + d[0];
-        user.data.row = (user.data.row ?? 0) + d[1];
+        if (!d) return false;
+        const nc = colOf(user) + d[0], nr = rowOf(user) + d[1];
+        if (isWall(nc, nr) || occupied(nc, nr, user)) return false;
+        user.data.col = nc;
+        user.data.row = nr;
         dirty = true;
-        io.to(user.username).emit("playerMove", { col: user.data.col, row: user.data.row });
+        io.to(user.username).emit("playerMove", { col: nc, row: nr });
+        return true;
     },
     attackClosest(user) {
-        for (const d of Object.values(DIRS)) {
-            const tx = (user.data.col ?? 0) + d[0], ty = (user.data.row ?? 0) + d[1];
-            const bot = liveBots().find(b => b.col === tx && b.row === ty);
-            if (!bot) continue;
-
-            bot.hp -= damageFor(user);
-            bot.lastHit = Date.now();
-            if (bot.hp <= 0) {
-                bot.dead = true;
-                bot.respawnAt = tick + RESPAWN_TICKS;
-                giveXp(user, bot.xp ?? 0);
-            }
-            return true;
-        }
+        for (const d of Object.values(DIRS))
+            if (strike(user, colOf(user) + d[0], rowOf(user) + d[1])) return true;
         return false;
     },
     attack(user, arg) {
         const d = DIRS[arg];
-        if (!d) return;
-        const tx = (user.data.col ?? 0) + d[0], ty = (user.data.row ?? 0) + d[1];
-        const bot = liveBots().find(b => b.col === tx && b.row === ty);
-        if (!bot) return;
-        bot.hp -= damageFor(user);
-        bot.lastHit = Date.now();
-        if (bot.hp > 0) return;
-        bot.dead = true;
-        bot.respawnAt = tick + RESPAWN_TICKS;
-        giveXp(user, bot.xp ?? 0);
+        if (!d) return false;
+        return strike(user, colOf(user) + d[0], rowOf(user) + d[1]);
     },
     wait() {},
 };
@@ -219,7 +551,11 @@ const ACTIONS = {
 setInterval(() => {
     tick++;
 
-    for (const u of users) {
+    if (tick % 10 === 0) for (const u of users) if (isActive(u) && hpOf(u) < maxHpFor(u)) { u.data.hp = hpOf(u) + 1; sendStats(u); }
+
+    const n = users.length;
+    for (let k = 0; k < n; k++) {
+        const u = users[(tick + k) % n];
         for (const s of u.data?.scripts ?? []) {
             if (!s.status.running) continue;
             const a = nextAction(s.id);
@@ -236,15 +572,17 @@ setInterval(() => {
 
     for (const b of bots) {
         if (b.dead && tick >= b.respawnAt) {
-            b.dead = false; b.col = b.spawn.col; b.row = b.spawn.row; b.hp = b.maxHp;
+            const t = nearestTileOpen(b.spawn.row, b.spawn.col);
+            if (t) { b.dead = false; [b.col, b.row] = t; b.hp = b.maxHp; b.lastAttacker = null; b.returning = false; b.nextAttack = 0; }
         }
+
     }
     
     for (const b of liveBots()) if (Object.hasOwn(BOT_AI, b.ai)) BOT_AI[b.ai](b);
 
     io.emit("entities", [
-        ...liveBots().map(b => ({ type: "bot", kind: b.kind, name: b.id, col: b.col, row: b.row, hp: b.hp, lastHit: b.lastHit || 0 })),
-        ...users.filter(isActive).map(u => ({ type: "user", name: u.username, col: u.data.col ?? 0, lastHit: u.lastHit || 0, row: u.data.row ?? 0 })),
+        ...liveBots().map(b => ({ type: "bot", kind: b.kind, ai: b.ai, name: b.id, col: b.col, row: b.row, hp: b.hp, maxHp: b.maxHp, lastHit: b.lastHit || 0 })),
+        ...users.filter(isActive).map(u => ({ type: "user", name: u.username, col: u.data.col ?? 0, lastHit: u.lastHit || 0, row: u.data.row ?? 0, hp: hpOf(u), maxHp: maxHpFor(u) })),
     ]);
 }, 200);
 
@@ -253,7 +591,7 @@ app.post("/login", (req, res) => {
     if (typeof username !== "string" || typeof password !== "string") return res.redirect("/");
 
     const account = accounts.find(a => a.username === username);
-    if (!account || !checkPassword(password, account)) return res.redirect("/");
+    if (!account || !checkPassword(password, account)) fail(res, "Invalid username or password");
 
     startSession(res, account);
     res.redirect("/");
@@ -261,13 +599,14 @@ app.post("/login", (req, res) => {
 
 const STARTER = `function init() {\n}\n\nfunction loop() {\n    if (player.queued > 0) return;\n    player.move("right");\n}\n`;
 
+const fail = (res, msg) => res.redirect("/?error=" + encodeURIComponent(msg));
+
 app.post("/register", (req, res) => {
     const { username, password } = req.body;
-    if (typeof username !== "string" || typeof password !== "string"
-        || !/^[A-Za-z0-9_]{3,20}$/.test(username) || password.length < 8) return res.redirect("/");
-
-    if (accounts.some(a => a.username.toLowerCase() === username.toLowerCase()))
-        return res.redirect("/");
+    if (typeof username !== "string" || typeof password !== "string") return fail(res, "Missing fields");
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return fail(res, "Username must be 3-20 letters, digits or _");
+    if (password.length < 8) return fail(res, "Password must be at least 8 characters");
+    if (accounts.some(a => a.username.toLowerCase() === username.toLowerCase())) return fail(res, "Username taken");
 
     const { salt, hash } = hashPassword(password);
     const account = { username, salt, hash };
@@ -283,7 +622,8 @@ app.post("/register", (req, res) => {
             }
         ]
     } };
-    users.push(user);
+
+    if (!users.some(u => u.username === username)) users.push(user);
 
     startSession(res, account);
     res.redirect("/");
@@ -332,15 +672,30 @@ io.use((socket, next) => {
 const MAX_SCRIPTS = 20;
 const MAX_SCRIPT_CHARS = 10_000;
 
+function newMap() {
+    walls = finalizeMap(regenMap());
+    io.emit("walls", walls);
+}
+
+for (const b of bots) {
+    if (!isWall(b.spawn.col, b.spawn.row)) continue;
+    const t = nearestTileOpen(b.spawn.row, b.spawn.col, { avoidOccupied: false });
+    if (t) { b.spawn = { col: t[0], row: t[1] }; b.col = t[0]; b.row = t[1]; }
+}
+
 io.on("connection", (socket) => {
     const user = getUser(socket.account.username);
     const scripts = user.data.scripts;
 
     socket.join(user.username);
 
+    if (user.data.col == null) respawn(user);
+
     online.set(user.username, (online.get(user.username) ?? 0) + 1)
 
     socket.emit("stats", statsOf(user));
+
+    socket.emit("walls", walls);
 
     socket.on("toggleScript", async (id) => {
         const s = typeof id === "string" && scripts.find(s => s.id === id);

@@ -82,7 +82,32 @@
         flex-direction: column;
         flex: 1;
     }
-</style>
+
+    #overlay {
+        position: fixed; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        background: rgba(0,0,0,0.5);
+    }
+    #apiRef {
+        background: #fff; border-radius: 8px; padding: 20px;
+        width: min(700px, 90vw); max-height: 85vh; overflow-y: auto;
+    }
+    #apiRef code, #apiRef pre { font-family: monospace; background: #f0f0f0; }
+    #apiRef pre { padding: 8px; border-radius: 4px; overflow-x: auto; }
+
+    #editorWrap { position: relative; flex: 1; min-height: 0; }
+    #editorWrap pre, #editorWrap textarea {
+        position: absolute; inset: 0; margin: 0; padding: 8px; border: 1px solid black;
+        font: 13px/1.4 monospace; white-space: pre; overflow: auto; tab-size: 4; box-sizing: border-box;
+    }
+    #hl { pointer-events: none; }
+    #hl code { padding: 0 !important; background: none !important; }
+    #editor { background: transparent; color: transparent; caret-color: black; resize: none; }
+
+    </style>
+    <link rel="stylesheet" href="/lib/highlight.js/styles/github.css">
+
+
 </head>
 <body>
     <div id="container">
@@ -98,12 +123,16 @@
                 <h1>Scripts</h1>
                 <button onclick="createScript();">+</button>
                 <div id="scriptsList"></div>
+                
+                <button onclick="showApi();">View API Reference</button>
             </div>
 
             <div id="edit">
                 <h1>Edit</h1>
-                <textarea id="editor" disabled spellcheck="false"
-                    style="flex:1; font-family:monospace; resize:none;"></textarea>
+                <div id="editorWrap">
+                    <pre id="hl" aria-hidden="true"><code class="language-javascript"></code></pre>
+                    <textarea id="editor" disabled spellcheck="false"></textarea>
+                </div>
             </div>
         </div>
     </div>
@@ -142,17 +171,78 @@
         <a href="javascript:switchLR();">Have an account?</a>
     </form>
 
+    <div id="overlay" hidden>
+        <div id="apiRef">
+            <button onclick="hideApi()" style="float:right">Close</button>
+            <h1>API Reference</h1>
+
+            <p>Define <code>loop()</code> (required, runs every tick, 50 ms limit) and optionally
+            <code>init()</code> (runs once, 500 ms limit). Scripts get 32 MB of memory.</p>
+
+            <h2>player</h2>
+            <p>Properties: <code>x</code>, <code>y</code>, <code>hp</code>, <code>maxHp</code>,
+            <code>xp</code>, <code>level</code>, <code>queued</code> (actions waiting).</p>
+            <p>Actions return <code>true</code> if queued, <code>false</code> if the queue (max 10) is full:</p>
+            <pre><code class="language-javascript">player.move(dir)
+player.attack(dir)
+player.attackClosest()
+player.wait()</code></pre>
+
+                    <h2>world</h2>
+                    <pre><code class="language-javascript">world.tick                 // current tick
+world.vision               // entities in view (free)
+world.nearestPlayerDistance
+world.wall(dx, dy)         // true if solid; beyond radius 20 counts as solid
+world.tiles(radius)        // 2 calls per tick
+world.scan(radius)         // entities within radius
+world.players(radius?)     // type "user"
+world.bots(radius?)        // type "bot"
+world.entities(radius?)    // everything</code></pre>
+                    <p>Without a radius, <code>players/bots/entities</code> filter <code>world.vision</code> for free.
+                    With a radius they run a scan: <b>2 scans per tick</b>, max radius <b>20</b>.</p>
+
+                    <h2>ui</h2>
+                    <pre><code class="language-javascript">const off = ui.onKey((key) => { ... });
+off(); // unsubscribe</code></pre>
+                    <p>Max 8 listeners. Key names are cut to 16 characters.</p>
+
+                    <h2>Logging</h2>
+                    <p><code>log(...)</code> and <code>console.log/warn/error</code>. Lines are cut to 200 characters.</p>
+
+                    <h2>Example</h2>
+                    <pre><code class="language-javascript">function loop() {
+    if (world.bots(5).length) player.attackClosest();
+    else player.wait();
+}</code></pre>
+            </div>
+        </div>
+
     <script>
         const loginForm = document.getElementById("loginForm");
         const registerForm = document.getElementById("registerForm");
+        const apiRef = document.getElementById("overlay");
 
         function switchLR() {
             loginForm.hidden = !loginForm.hidden;
             registerForm.hidden = !registerForm.hidden;
         }
+
+        const overlay = document.getElementById("overlay");
+        function showApi() { overlay.hidden = false; }
+        function hideApi() { overlay.hidden = true; }
+        overlay.addEventListener("click", (e) => { if (e.target === overlay) hideApi(); });
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideApi(); });
     </script>
 
     <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const p = new URLSearchParams(window.location.search);
+        if (p.get("error")) {
+            alert(p.get("error"));
+            history.replaceState(null, "", "/");
+        }
+    </script>
+    <script type="module" src="highlight.js"></script>
     <script src="game.js"></script>
 </body>
 </html>

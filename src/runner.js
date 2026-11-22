@@ -6,12 +6,14 @@ const INIT_TIMEOUT = 500;
 const LOOP_TIMEOUT = 50;
 const SCANS_PER_TICK = 2;
 const MAX_SCAN_RADIUS = 20;
+const TILES_PER_TICK = 2;
 const MAX_QUEUE = 10;
 
 const BOOTSTRAP = `
 (function () {
-    const ac = __act, lg = __log, sc = __scan;
+    const ac = __act, lg = __log, sc = __scan, wl = __wall, ti = __tiles;
     delete global.__act; delete global.__log; delete global.__scan;
+    delete global.__wall; delete global.__tiles;
     let state = { tick: 0, player: {}, vision: [], nearestPlayerDistance: null };
 
     global.__setState = (s) => { state = s; };
@@ -20,6 +22,7 @@ const BOOTSTRAP = `
         get x()      { return state.player.x; },
         get y()      { return state.player.y; },
         get hp()     { return state.player.hp; },
+        get maxHp() { return state.player.maxHp; },
         get queued() { return state.player.queued; },
         move(dir)   { return ac("move", String(dir)); },
         attack(dir) { return ac("attack", String(dir)); },
@@ -65,6 +68,8 @@ const BOOTSTRAP = `
         get vision() { return state.vision; },
         get nearestPlayerDistance() { return state.nearestPlayerDistance; },
         get tick() { return state.tick; },
+        wall(dx, dy) { return wl(Number(dx), Number(dy)); },
+        tiles(radius) { return JSON.parse(ti(Number(radius))); },
         scan(radius) { return scan(radius); },
         players(radius)  { return pick("user", radius); },
         bots(radius)     { return pick("bot", radius); },
@@ -86,7 +91,7 @@ async function startRuntime(s, api, getSnapshot, onStop) {
     const isolate = new ivm.Isolate({ memoryLimit: 32 });
     const rt = { isolate, init: null, loop: null, setState: null, dispatch: null,
              getSnapshot, onStop, busy: false, stopped: false,
-             scansLeft: SCANS_PER_TICK, queue: [], pendingEvents: 0 };
+             scansLeft: SCANS_PER_TICK, tilesLeft: TILES_PER_TICK, queue: [], pendingEvents: 0 };
 
     try {
         const context = await isolate.createContext();
@@ -105,6 +110,19 @@ async function startRuntime(s, api, getSnapshot, onStop) {
             const radius = Math.min(Math.max(Number(r) || 0, 0), MAX_SCAN_RADIUS);
             const type = t === "user" || t === "bot" ? t : undefined;
             return JSON.stringify(api.scan(radius, type));
+        }));
+        await jail.set("__wall", new ivm.Callback((dx, dy) => {
+            dx = Math.trunc(Number(dx)) || 0;
+            dy = Math.trunc(Number(dy)) || 0;
+            if (Math.abs(dx) > MAX_SCAN_RADIUS || Math.abs(dy) > MAX_SCAN_RADIUS) return true; // unknown = solid
+            return api.wall(dx, dy);
+        }));
+
+        await jail.set("__tiles", new ivm.Callback((r) => {
+            if (rt.tilesLeft <= 0) return "[]";
+            rt.tilesLeft--;
+            const radius = Math.min(Math.max(Math.trunc(Number(r)) || 0, 0), MAX_SCAN_RADIUS);
+            return JSON.stringify(api.tiles(radius));
         }));
 
         await (await isolate.compileScript(BOOTSTRAP)).run(context);
@@ -139,6 +157,7 @@ async function tickRuntime(id) {
     rt.busy = true;
     try {
         rt.scansLeft = SCANS_PER_TICK;
+        rt.tilesLeft = TILES_PER_TICK;
         await pushState(rt);
         await rt.loop.apply(undefined, [], { timeout: LOOP_TIMEOUT });
     } catch (e) {
