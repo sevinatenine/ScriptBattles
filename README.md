@@ -16,6 +16,10 @@ npm install
 node src/main.js
 ```
 
+## Controls
+
+You make them with your scripts!
+
 ## Connecting
 
 Go to [scriptbattles.simon312.hackclub.app](https://scriptbattles.simon312.hackclub.app).
