@@ -84,6 +84,7 @@ const KINDS = ["wanderer","crawler","skulker","brute","stalker","warden","reaver
 
 var images = {
     heart: "assets/heart.png",
+    wall: "assets/wall.png"
 };
 
 for (var i of KINDS) {
@@ -287,6 +288,55 @@ function drawDrops() {
 
 const WALL_COLOR = "#333";
 
+const SAFE_ZONE_RADIUS = 8;                       // keep in sync with the server
+const SAFE_ZONE_CENTER = { col: 0, row: 0 };      // same as the server's SPAWN
+
+// same test as the server's inSafeZone()
+const inSafeZone = (col, row) =>
+    Math.hypot(col - SAFE_ZONE_CENTER.col, row - SAFE_ZONE_CENTER.row) <= SAFE_ZONE_RADIUS;
+
+// built once: the zone's tiles, plus every tile edge that borders the outside
+const safeTiles = [];
+const safeEdges = [];   // [x1, y1, x2, y2] in tile units
+for (let dy = -SAFE_ZONE_RADIUS; dy <= SAFE_ZONE_RADIUS; dy++) {
+    for (let dx = -SAFE_ZONE_RADIUS; dx <= SAFE_ZONE_RADIUS; dx++) {
+        const c = SAFE_ZONE_CENTER.col + dx, r = SAFE_ZONE_CENTER.row + dy;
+        if (!inSafeZone(c, r)) continue;
+        safeTiles.push([c, r]);
+        if (!inSafeZone(c, r - 1)) safeEdges.push([c, r, c + 1, r]);          // top
+        if (!inSafeZone(c, r + 1)) safeEdges.push([c, r + 1, c + 1, r + 1]);  // bottom
+        if (!inSafeZone(c - 1, r)) safeEdges.push([c, r, c, r + 1]);          // left
+        if (!inSafeZone(c + 1, r)) safeEdges.push([c + 1, r, c + 1, r + 1]);  // right
+    }
+}
+
+function drawSafeZone() {
+    const toScreen = (c, r) => worldToScreen(c * CELL_WIDTH, r * CELL_HEIGHT);
+    ctx.save();
+
+    ctx.fillStyle = "rgba(80, 200, 120, 0.15)";
+    ctx.beginPath();
+    for (const [c, r] of safeTiles) {
+        if (wallAt(c, r)) continue;
+        const a = toScreen(c, r), b = toScreen(c + 1, r + 1);
+        const x0 = Math.round(a.x), y0 = Math.round(a.y);
+        ctx.rect(x0, y0, Math.round(b.x) - x0, Math.round(b.y) - y0);
+    }
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(40, 150, 80, 0.9)";
+    ctx.lineWidth = Math.max(2, 3 * camera.zoom);
+    ctx.lineCap = "square";
+    ctx.beginPath();
+    for (const [x1, y1, x2, y2] of safeEdges) {
+        const a = toScreen(x1, y1), b = toScreen(x2, y2);
+        ctx.moveTo(Math.round(a.x), Math.round(a.y));
+        ctx.lineTo(Math.round(b.x), Math.round(b.y));
+    }
+    ctx.stroke();
+
+    ctx.restore();
+}
 function drawWalls() {
     if (!walls.length) return;
 
@@ -296,16 +346,24 @@ function drawWalls() {
     const r0 = Math.floor(tl.y / CELL_HEIGHT), r1 = Math.floor(br.y / CELL_HEIGHT);
 
     const w = CELL_WIDTH * camera.zoom, h = CELL_HEIGHT * camera.zoom;
+    const tileW = Math.ceil(w) + 1, tileH = Math.ceil(h) + 1;   // +1 overlaps neighbors so there are no seams
+    const img = loadedImages.wall;
 
-    ctx.fillStyle = WALL_COLOR;
+    ctx.save();
+    if (img) ctx.imageSmoothingEnabled = img.width > w;
+    else ctx.fillStyle = WALL_COLOR;
+
     for (let r = r0; r <= r1; r++) {
         for (let c = c0; c <= c1; c++) {
             if (!wallAt(c, r)) continue;
-            const p = worldToScreen(c * CELL_WIDTH, r * CELL_HEIGHT);
+            const p = worldToScreen(c * CELL_WIDTH, r * CELL_HEIGHT);   // tile's top-left corner
+            const x = Math.floor(p.x), y = Math.floor(p.y);
 
-            ctx.fillRect(Math.floor(p.x), Math.floor(p.y), Math.ceil(w) + 1, Math.ceil(h) + 1);
+            if (img) ctx.drawImage(img, x, y, tileW, tileH);
+            else ctx.fillRect(x, y, tileW, tileH);
         }
     }
+    ctx.restore();
 }
 
 var walls = [];
@@ -360,6 +418,7 @@ function draw(now) {
 
     ctx.clearRect(0, 0, width, height);
     drawWalls();
+    drawSafeZone();
     const origin = worldToScreen(0, 0);
     drawGrid(origin.x, origin.y);
     drawPlayer();

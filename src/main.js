@@ -48,6 +48,8 @@ const MAP_Y_OFFSET = -150;
 const MAP_SIZE = 301;
 
 const SPAWN = { col: 0, row: 0 };
+const SAFE_ZONE_RADIUS = 8;
+const inSafeZone = (col, row) => Math.hypot(col - SPAWN.col, row - SPAWN.row) <= SAFE_ZONE_RADIUS;
 const SPAWN_PROTECTION_TICKS = 10;
 const TIERS = [
     { kind: "wanderer", maxDist: 15,       hp: 30,   xp: 50,   damage: 0,  ai: "wander",    moveChance: 0.3 },
@@ -209,6 +211,7 @@ const nearestPlayer = (b, radius) => {
     let best = null, bestD = radius;
     for (const u of users) {
         if (!isActive(u)) continue;
+        if (inSafeZone(colOf(u), rowOf(u))) continue;
         if ((protectedUntil.get(u.username) ?? 0) > tick) continue;
         const d = Math.hypot(colOf(u) - b.col, rowOf(u) - b.row);
         if (d <= bestD) { best = u; bestD = d; }
@@ -247,6 +250,7 @@ function killPlayer(victim, killerLabel) {
 function hurt(victim, dmg, attacker) {
     if (!victim) return false;
     if ((protectedUntil.get(victim.username) ?? 0) > tick) return false;
+    if (inSafeZone(colOf(victim), rowOf(victim))) return false;
 
     victim.data.hp = hpOf(victim) - dmg;
     victim.lastHit = Date.now();
@@ -576,6 +580,7 @@ function strike(user, tx, ty) {
     const victim = users.find(u => u !== user && isActive(u) && colOf(u) === tx && rowOf(u) === ty);
     if (!victim) return false;
     if ((protectedUntil.get(victim.username) ?? 0) > tick) return false;
+    if (inSafeZone(tx, ty) || inSafeZone(colOf(user), rowOf(user))) return false;
 
     victim.data.hp = hpOf(victim) - damageFor(user);
     victim.lastHit = Date.now();
@@ -702,7 +707,7 @@ app.post("/login", (req, res) => {
     if (typeof username !== "string" || typeof password !== "string") return res.redirect("/");
 
     const account = accounts.find(a => a.username === username);
-    if (!account || !checkPassword(password, account)) fail(res, "Invalid username or password");
+    if (!account || !checkPassword(password, account)) return fail(res, "Invalid username or password");
 
     startSession(res, account);
     res.redirect("/");
@@ -924,8 +929,6 @@ io.on("connection", (socket) => {
     online.set(user.username, (online.get(user.username) ?? 0) + 1)
 
     socket.emit("leaderboard", leaderboardPayload(user.username));
-
-    socket.emit("stats", statsOf(user));
 
     socket.emit("stats", statsOf(user));
 
