@@ -1,6 +1,12 @@
 # ScriptBattles
 
+![Running image](/assets/running.png)
+
 ScriptBattles is an online combat game. You control a player who can move around and attack other bots and players. But, you can't control him yourself - you have to make scripts to. Your scripts can control the players attacks and movements and can receive input from the world as well. The server for the game is written in NodeJS and is accesible [here](https://scriptbattles.simon312.hackclub.app).
+
+## Why
+
+I made this game because I got bored with a lot of the games I have been playing and I wanted to make a game that is more customizable and creative.
 
 ## Testing
 
