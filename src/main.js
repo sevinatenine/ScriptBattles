@@ -702,7 +702,17 @@ setInterval(() => {
     }
 }, 4000);
 
-app.post("/login", (req, res) => {
+const attempts = new Map();
+function limited(req, res, next) {
+    const now = Date.now(), ip = req.ip;
+    let a = attempts.get(ip);
+    if (!a || a.reset < now) a = { n: 0, reset: now + 60_000 };
+    attempts.set(ip, a);
+    if (++a.n > 10) return fail(res, "Too many attempts, wait a minute");
+    next();
+}
+
+app.post("/login", limited, (req, res) => {
     const { username, password } = req.body;
     if (typeof username !== "string" || typeof password !== "string") return res.redirect("/");
 
@@ -814,7 +824,7 @@ function loop() {
 
 const fail = (res, msg) => res.redirect("/?error=" + encodeURIComponent(msg));
 
-app.post("/register", (req, res) => {
+app.post("/register", limited, (req, res) => {
     const { username, password } = req.body;
     if (typeof username !== "string" || typeof password !== "string") return fail(res, "Missing fields");
     if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return fail(res, "Username must be 3-20 letters, digits or _");
